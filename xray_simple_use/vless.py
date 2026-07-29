@@ -2,6 +2,7 @@
 Parse VLESS share link and generate Xray-core client JSON config.
 """
 
+import os
 from dataclasses import dataclass, field
 from urllib.parse import urlparse, parse_qs, unquote
 from typing import Optional
@@ -29,10 +30,30 @@ class VLESSConfig:
     mode: str = ""
     remark: str = ""
     authority: str = ""
+    origin_address: str = ""  # Original hostname from the link, preserved for SNI
 
     def to_dict(self) -> dict:
         """Return a dict summary of non-empty fields."""
         return {k: v for k, v in self.__dict__.items() if v}
+
+    def to_dict_safe(self) -> dict:
+        """Return a dict summary with credentials masked for logging."""
+        safe: dict = {}
+        for k, v in self.__dict__.items():
+            if not v:
+                continue
+            if k in ("uuid", "sid", "pbk"):
+                safe[k] = _mask(v)
+            else:
+                safe[k] = v
+        return safe
+
+
+def _mask(s: str, show: int = 4) -> str:
+    """Mask a string, showing only first and last 'show' characters."""
+    if len(s) <= show * 2:
+        return "*" * len(s)
+    return s[:show] + "*" * (len(s) - show * 2) + s[-show:]
 
 
 def parse_vless_link(url: str) -> VLESSConfig:
@@ -83,6 +104,10 @@ def parse_vless_link(url: str) -> VLESSConfig:
     mode = _get(params, "mode", "")
     authority = _get(params, "authority", "")
 
+    # Determine origin_address: use sni if it's a domain, otherwise use address
+    # This is the original hostname preserved for SNI fallback
+    origin = sni if sni else address
+
     return VLESSConfig(
         uuid=uuid,
         address=address,
@@ -102,6 +127,7 @@ def parse_vless_link(url: str) -> VLESSConfig:
         mode=mode,
         remark=remark,
         authority=authority,
+        origin_address=origin,
     )
 
 
@@ -117,31 +143,10 @@ def generate_client_config(cfg: VLESSConfig, socks_port: int = 10808, http_port:
     Returns:
         dict suitable for json.dump as Xray-core config.
     """
-    stream_settings = _build_stream_settings(cfg)
-    vnext_user = {
-        "id": cfg.uuid,
-        "encryption": cfg.encryption,
-    }
-    if cfg.flow:
-        vnext_user["flow"] = cfg.flow
-
-    outbound = {
-        "protocol": "vless",
-        "settings": {
-            "vnext": [{
-                "address": cfg.address,
-                "port": cfg.port,
-                "users": [vnext_user],
-            }]
-        },
-        "streamSettings": stream_settings,
-        "tag": "proxy",
-    }
+    outbound = _build_outbound(cfg, cfg.address, "proxy")
 
     config = {
-        "log": {
-            "loglevel": "warning",
-        },
+        "log": {"loglevel": "warning"},
         "inbounds": [
             {
                 "tag": "socks",
@@ -160,11 +165,7 @@ def generate_client_config(cfg: VLESSConfig, socks_port: int = 10808, http_port:
         ],
         "outbounds": [
             outbound,
-            {
-                "protocol": "freedom",
-                "tag": "direct",
-                "settings": {},
-            },
+            {"protocol": "freedom", "tag": "direct", "settings": {}},
         ],
         "routing": {
             "domainStrategy": "AsIs",
@@ -181,120 +182,26 @@ def generate_client_config(cfg: VLESSConfig, socks_port: int = 10808, http_port:
     return config
 
 
-def _build_stream_settings(cfg: VLESSConfig) -> dict:
-    """Build streamSettings section from VLESSConfig."""
-    settings: dict = {
-        "network": cfg.network,
-    }
-
-    if cfg.security not in ("none", ""):
-        settings["security"] = cfg.security
-
-    # Reality settings
-    if cfg.security == "reality":
-        reality: dict = {}
-        if cfg.sni:
-            reality["serverName"] = cfg.sni
-        if cfg.fp:
-            reality["fingerprint"] = cfg.fp
-        if cfg.pbk:
-            reality["publicKey"] = cfg.pbk
-        if cfg.sid:
-            reality["shortId"] = cfg.sid
-        if cfg.spx:
-            reality["spiderX"] = cfg.spx
-        settings["realitySettings"] = reality
-
-    # TLS settings
-    if cfg.security == "tls":
-        tls: dict = {}
-        if cfg.sni:
-            tls["serverName"] = cfg.sni
-        if cfg.fp:
-            tls["fingerprint"] = cfg.fp
-        settings["tlsSettings"] = tls
-
-    # Transport-specific settings
-    if cfg.network == "ws":
-        ws: dict = {}
-        if cfg.path:
-            ws["path"] = cfg.path
-        if cfg.host:
-            ws["headers"] = {"Host": cfg.host}
-        settings["wsSettings"] = ws
-
-    elif cfg.network == "grpc":
-        grpc: dict = {}
-        if cfg.service_name:
-            grpc["serviceName"] = cfg.service_name
-        if cfg.mode:
-            grpc["multiMode"] = cfg.mode == "multi"
-        if cfg.authority:
-            grpc["authority"] = cfg.authority
-        settings["grpcSettings"] = grpc
-
-    elif cfg.network in ("h2", "http"):
-        if cfg.host:
-            settings["httpSettings"] = {"host": [cfg.host]}
-        if cfg.path:
-            if "httpSettings" not in settings:
-                settings["httpSettings"] = {}
-            settings["httpSettings"]["path"] = cfg.path
-
-    elif cfg.network == "tcp":
-        tcp: dict = {}
-        if cfg.host:
-            tcp["header"] = {"type": "http", "request": {"headers": {"Host": [cfg.host]}}}
-        settings["tcpSettings"] = tcp if tcp else {}
-
-    return settings
-
-
-def ensure_server_name(config: dict) -> str:
-    """
-    Ensure TLS/serverName is set if address is a domain.
-
-    When optimize replaces a domain address with an IP, TLS/REALITY needs an
-    explicit serverName to pass SNI validation. If the current address is not
-    an IP and the stream security settings lack serverName, fill it in.
-
-    Args:
-        config: Xray config dict.
-
-    Returns:
-        The current address from the outbound config.
-    """
-    from ipaddress import ip_address
-
-    outbound = config["outbounds"][0]
-    stream = outbound["streamSettings"]
-    address = outbound["settings"]["vnext"][0]["address"]
-    security = stream.get("security", "")
-
-    # Only needed when address is a domain (not an IP)
-    try:
-        ip_address(address)
-        return address  # Already an IP, SNI can't be derived from it anyway
-    except ValueError:
-        pass  # It's a domain, need to ensure serverName
-
-    if security == "reality":
-        reality = stream.get("realitySettings", {})
-        if not reality.get("serverName"):
-            reality["serverName"] = address
-            stream["realitySettings"] = reality
-    elif security == "tls":
-        tls = stream.get("tlsSettings", {})
-        if not tls.get("serverName"):
-            tls["serverName"] = address
-            stream["tlsSettings"] = tls
-
-    return address
+def _effective_sni(cfg: VLESSConfig) -> str:
+    """Get effective SNI: explicit sni, or origin_address if it's a domain."""
+    if cfg.sni:
+        return cfg.sni
+    # If origin_address looks like a domain (not an IP), use it
+    if cfg.origin_address:
+        try:
+            from ipaddress import ip_address
+            ip_address(cfg.origin_address)
+            return ""  # It's an IP, no SNI possible
+        except ValueError:
+            return cfg.origin_address
+    return ""
 
 
 def _build_outbound(cfg: VLESSConfig, address: str, tag: str) -> dict:
     """
     Build a single VLESS outbound entry with a specific address and tag.
+
+    Ensures SNI is preserved: uses cfg.sni or cfg.origin_address as fallback.
 
     Args:
         cfg: Base VLESS configuration.
@@ -323,6 +230,69 @@ def _build_outbound(cfg: VLESSConfig, address: str, tag: str) -> dict:
     }
 
 
+def _build_stream_settings(cfg: VLESSConfig) -> dict:
+    """Build streamSettings section from VLESSConfig."""
+    settings: dict = {"network": cfg.network}
+    eff_sni = _effective_sni(cfg)
+
+    if cfg.security not in ("none", ""):
+        settings["security"] = cfg.security
+
+    if cfg.security == "reality":
+        reality: dict = {}
+        if eff_sni:
+            reality["serverName"] = eff_sni
+        if cfg.fp:
+            reality["fingerprint"] = cfg.fp
+        if cfg.pbk:
+            reality["publicKey"] = cfg.pbk
+        if cfg.sid:
+            reality["shortId"] = cfg.sid
+        if cfg.spx:
+            reality["spiderX"] = cfg.spx
+        settings["realitySettings"] = reality
+
+    elif cfg.security == "tls":
+        tls: dict = {}
+        if eff_sni:
+            tls["serverName"] = eff_sni
+        if cfg.fp:
+            tls["fingerprint"] = cfg.fp
+        settings["tlsSettings"] = tls
+
+    if cfg.network == "ws":
+        ws: dict = {}
+        if cfg.path:
+            ws["path"] = cfg.path
+        if cfg.host:
+            ws["headers"] = {"Host": cfg.host}
+        settings["wsSettings"] = ws
+
+    elif cfg.network == "grpc":
+        grpc: dict = {}
+        if cfg.service_name:
+            grpc["serviceName"] = cfg.service_name
+        if cfg.mode:
+            grpc["multiMode"] = cfg.mode == "multi"
+        if cfg.authority:
+            grpc["authority"] = cfg.authority
+        settings["grpcSettings"] = grpc
+
+    elif cfg.network in ("h2", "http"):
+        if cfg.host:
+            settings["httpSettings"] = {"host": [cfg.host]}
+        if cfg.path:
+            settings.setdefault("httpSettings", {})["path"] = cfg.path
+
+    elif cfg.network == "tcp":
+        tcp: dict = {}
+        if cfg.host:
+            tcp["header"] = {"type": "http", "request": {"headers": {"Host": [cfg.host]}}}
+        settings["tcpSettings"] = tcp if tcp else {}
+
+    return settings
+
+
 def _build_test_socks_inbound(port: int, outbound_tag: str) -> dict:
     """Build a SOCKS5 inbound that routes to a specific outbound."""
     return {
@@ -338,68 +308,27 @@ def generate_test_config(
     cfg: VLESSConfig,
     ips: list[str],
     active_ip: str = "",
-    socks_port: int = 10808,
-    http_port: int = 10809,
     test_base_port: int = 11001,
 ) -> dict:
     """
-    Generate a multi-outbound Xray config for concurrent candidate testing.
+    Generate a test-only Xray config for concurrent candidate testing.
 
-    Structure:
-      inbounds:
-        socks:10808 → proxy (main)
-        socks:11001 → candidate-1-out (test port for IP 1)
-        socks:11002 → candidate-2-out
-        ...
-      outbounds:
-        proxy (active_ip)
-        candidate-1-out (ip1)
-        candidate-2-out (ip2)
-        ...
-        direct (freedom)
+    Contains ONLY test SOCKS inbounds and candidate outbounds —
+    does NOT include 10808/10809 or a proxy outbound (those belong
+    to the production xray instance).
 
     Args:
-        cfg: Base VLESS configuration (protocol params shared by all outbounds).
-        ips: Candidate IP addresses to create test outbounds for.
-        active_ip: Current active IP for the main proxy outbound.
-        socks_port: Main SOCKS5 port.
-        http_port: Main HTTP proxy port.
-        test_base_port: Starting port for per-candidate test SOCKS inbounds.
+        cfg: Base VLESS configuration.
+        ips: Candidate IP addresses.
+        active_ip: Not used in test config (production only).
+        test_base_port: Starting port for test SOCKS inbounds.
 
     Returns:
-        Xray config dict.
+        Xray config dict for a temporary test instance.
     """
-    if not active_ip:
-        active_ip = ips[0] if ips else cfg.address
-
-    inbounds = [
-        {
-            "tag": "socks",
-            "port": socks_port,
-            "listen": "127.0.0.1",
-            "protocol": "socks",
-            "settings": {"udp": True},
-        },
-        {
-            "tag": "http",
-            "port": http_port,
-            "listen": "127.0.0.1",
-            "protocol": "http",
-            "settings": {},
-        },
-    ]
-
-    outbounds = [
-        _build_outbound(cfg, active_ip, "proxy"),
-    ]
-
-    routing_rules = [
-        {
-            "type": "field",
-            "inboundTag": ["socks", "http"],
-            "outboundTag": "proxy",
-        },
-    ]
+    inbounds: list[dict] = []
+    outbounds: list[dict] = []
+    routing_rules: list[dict] = []
 
     for i, ip in enumerate(ips):
         tag = f"candidate-{i + 1}-out"
@@ -431,19 +360,63 @@ def generate_test_config(
     }
 
 
+def ensure_server_name(config: dict) -> str:
+    """
+    Ensure TLS/serverName is set if address is a domain.
+
+    Args:
+        config: Xray config dict.
+
+    Returns:
+        The current address from the outbound config.
+    """
+    from ipaddress import ip_address
+
+    outbound = config["outbounds"][0]
+    stream = outbound["streamSettings"]
+    address = outbound["settings"]["vnext"][0]["address"]
+    security = stream.get("security", "")
+
+    try:
+        ip_address(address)
+        return address
+    except ValueError:
+        pass
+
+    if security == "reality":
+        reality = stream.get("realitySettings", {})
+        if not reality.get("serverName"):
+            reality["serverName"] = address
+            stream["realitySettings"] = reality
+    elif security == "tls":
+        tls = stream.get("tlsSettings", {})
+        if not tls.get("serverName"):
+            tls["serverName"] = address
+            stream["tlsSettings"] = tls
+
+    return address
+
+
 def save_config(config: dict, filepath: str) -> None:
-    """Save config dict as JSON file.
+    """
+    Save config dict as JSON file atomically, with 0600 permissions.
 
     Args:
         config: Xray config dict.
         filepath: Output file path.
     """
+    tmp_path = filepath + ".tmp"
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
+    try:
+        os.chmod(filepath, 0o600)
+    except OSError:
+        pass
 
 
 def load_config(filepath: str) -> dict:
-    """Load config dict from JSON file.
+    """
+    Load config dict from JSON file.
 
     Args:
         filepath: Path to the config JSON file.
