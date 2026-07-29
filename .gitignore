@@ -12,3 +12,4 @@ secrets.ini
 queue.json
 *.log
 cfst_result*.csv
+logs/

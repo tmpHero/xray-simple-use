@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from xray_simple_use.config import load_ini, Config
+from xray_simple_use.stability_test import StabilityTest
 
 from xray_simple_use.vless import (
     parse_vless_link,
@@ -98,6 +99,11 @@ def main():
     p_run.add_argument("--socks-port", type=int, default=10808, help="SOCKS5 port (default: 10808)")
     p_run.add_argument("--http-port", type=int, default=10809, help="HTTP proxy port (default: 10809)")
 
+    # stability-test
+    p_stab = subparsers.add_parser("stability-test", help="Run 24h stability test (daemon must be running)")
+    p_stab.add_argument("--duration", type=str, default="24h", help="Test duration (e.g. 1h, 24h, 30m)")
+    p_stab.add_argument("--download-url", type=str, default="http://speedtest.tele2.net/5MB.zip", help="URL for download test")
+
     # setup
     subparsers.add_parser("setup", help="Download xray-core and CloudflareSpeedTest")
 
@@ -115,6 +121,7 @@ def main():
         "optimize": cmd_optimize,
         "speedtest": cmd_speedtest,
         "run": cmd_run,
+        "stability-test": cmd_stability_test,
         "setup": cmd_setup,
     }
 
@@ -342,6 +349,29 @@ def cmd_speedtest(args):
             print(f"  Duration: {dl_result.download_duration_s}s")
         else:
             print(f"  Failed: {dl_result.error}")
+
+
+def cmd_stability_test(args):
+    """Run 24-hour stability test against the HTTP proxy."""
+    duration_s = _parse_duration(args.duration)
+    test = StabilityTest(duration_seconds=duration_s, download_url=args.download_url)
+    test.run()
+
+
+def _parse_duration(s: str) -> int:
+    """Parse duration string like '24h', '1h30m', '30m' into seconds."""
+    import re
+    total = 0
+    m = re.match(r"(\d+)h", s)
+    if m:
+        total += int(m.group(1)) * 3600
+    m = re.match(r".*?(\d+)m", s)
+    if m:
+        total += int(m.group(1)) * 60
+    m = re.match(r".*?(\d+)s", s)
+    if m:
+        total += int(m.group(1))
+    return total if total > 0 else 86400  # default 24h
 
 
 def cmd_setup(args):
