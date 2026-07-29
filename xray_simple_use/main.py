@@ -40,6 +40,7 @@ from xray_simple_use.speedtest import (
     quick_verify,
     check_curl_available,
 )
+from xray_simple_use.daemon import Daemon
 
 
 def main():
@@ -88,6 +89,12 @@ def main():
         help="Test mode (default: all)",
     )
 
+    # run
+    p_run = subparsers.add_parser("run", help="Start daemon with health monitoring and failover")
+    p_run.add_argument("url", help="vless:// share link URL")
+    p_run.add_argument("--socks-port", type=int, default=10808, help="SOCKS5 port (default: 10808)")
+    p_run.add_argument("--http-port", type=int, default=10809, help="HTTP proxy port (default: 10809)")
+
     # setup
     subparsers.add_parser("setup", help="Download xray-core and CloudflareSpeedTest")
 
@@ -104,6 +111,7 @@ def main():
         "status": cmd_status,
         "optimize": cmd_optimize,
         "speedtest": cmd_speedtest,
+        "run": cmd_run,
         "setup": cmd_setup,
     }
 
@@ -162,6 +170,19 @@ def cmd_status(args):
         print(f"Config: {st['config']}")
     else:
         print("Xray is not running.")
+
+
+def cmd_run(args):
+    """Start daemon with health monitoring and automatic failover."""
+    cfg = parse_vless_link(args.url)
+    print("=== VLESS Config ===")
+    for key, val in cfg.to_dict().items():
+        print(f"  {key}: {val}")
+
+    daemon = Daemon(cfg)
+    daemon._socks_port = args.socks_port
+    daemon._http_port = args.http_port
+    daemon.run()
 
 
 def cmd_optimize(args):
