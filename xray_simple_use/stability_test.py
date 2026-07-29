@@ -385,7 +385,7 @@ class StabilityTest:
         print(f"IP switches        {r.ip_switches}")
         print(f"Failed switches    {r.failed_switches}")
         print(f"Xray crashes       {r.xray_crashes}")
-        print(f"Max memory         {r.report.max_memory_mb:.0f} MB")
+        print(f"Max memory         {r.max_memory_mb:.0f} MB")
         print()
         print(f"Result             {'PASS' if r.passed else 'FAIL'}")
 
