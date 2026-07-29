@@ -69,16 +69,26 @@ def _test_single_ip(
         cmd = [
             _CURL_BIN,
             "--socks5-hostname", f"127.0.0.1:{socks_port}",
+            "--fail",
             "-s", "-o", "/dev/null",
-            "-w", "%{time_total}",
+            "-w", "%{http_code}\n%{time_total}",
             "--max-time", str(timeout),
             test_url,
         ]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 3)
             if proc.returncode == 0:
+                # Parse http_code and time_total
+                lines = proc.stdout.strip().split("\n")
+                http_code = lines[0].strip() if lines else ""
+                if http_code not in ("204", "200"):
+                    failure += 1
+                    continue
+                try:
+                    lat = float(lines[1].strip()) * 1000
+                except (IndexError, ValueError):
+                    lat = 0.0
                 success += 1
-                lat = float(proc.stdout.strip()) * 1000  # seconds to ms
                 latencies.append(lat)
             else:
                 failure += 1

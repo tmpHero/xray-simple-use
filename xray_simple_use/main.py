@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+from xray_simple_use.config import load_ini, Config
+
 from xray_simple_use.vless import (
     parse_vless_link,
     generate_client_config,
@@ -91,7 +93,8 @@ def main():
 
     # run
     p_run = subparsers.add_parser("run", help="Start daemon with health monitoring and failover")
-    p_run.add_argument("url", help="vless:// share link URL")
+    p_run.add_argument("url", nargs="?", default="", help="vless:// share link URL (optional if --config is used)")
+    p_run.add_argument("--config", type=str, default="", help="Path to config.ini (default: auto-detect)")
     p_run.add_argument("--socks-port", type=int, default=10808, help="SOCKS5 port (default: 10808)")
     p_run.add_argument("--http-port", type=int, default=10809, help="HTTP proxy port (default: 10809)")
 
@@ -174,12 +177,21 @@ def cmd_status(args):
 
 def cmd_run(args):
     """Start daemon with health monitoring and automatic failover."""
-    cfg = parse_vless_link(args.url)
+    # Load config
+    config_path = Path(args.config) if args.config else None
+    app_config = load_ini(config_path)
+
+    vless_url = args.url or app_config.vless_url
+    if not vless_url:
+        print("Error: No VLESS URL provided. Use --url or set [server] vless_url in config.ini")
+        sys.exit(1)
+
+    cfg = parse_vless_link(vless_url)
     print("=== VLESS Config ===")
     for key, val in cfg.to_dict_safe().items():
         print(f"  {key}: {val}")
 
-    daemon = Daemon(cfg)
+    daemon = Daemon(cfg, app_config)
     daemon._socks_port = args.socks_port
     daemon._http_port = args.http_port
     daemon.run()

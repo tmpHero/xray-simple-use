@@ -3,5 +3,12 @@ __pycache__/
 .venv/
 third_party/
 config.json
+xray-config.json
 *.pid
 uv.lock
+config.ini
+*.local.ini
+secrets.ini
+queue.json
+*.log
+cfst_result*.csv
