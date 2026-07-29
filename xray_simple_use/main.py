@@ -129,7 +129,7 @@ def cmd_parse(args):
     """Parse vless link and display config summary."""
     cfg = parse_vless_link(args.url)
     print("=== VLESS Config ===")
-    for key, val in cfg.to_dict().items():
+    for key, val in cfg.to_dict_safe().items():
         print(f"  {key}: {val}")
 
     config = generate_client_config(cfg)
@@ -141,7 +141,7 @@ def cmd_start(args):
     """Parse vless link, generate config, start xray."""
     cfg = parse_vless_link(args.url)
     print("=== VLESS Config ===")
-    for key, val in cfg.to_dict().items():
+    for key, val in cfg.to_dict_safe().items():
         print(f"  {key}: {val}")
 
     config = generate_client_config(cfg, socks_port=args.socks_port, http_port=args.http_port)
@@ -176,7 +176,7 @@ def cmd_run(args):
     """Start daemon with health monitoring and automatic failover."""
     cfg = parse_vless_link(args.url)
     print("=== VLESS Config ===")
-    for key, val in cfg.to_dict().items():
+    for key, val in cfg.to_dict_safe().items():
         print(f"  {key}: {val}")
 
     daemon = Daemon(cfg)
@@ -186,7 +186,13 @@ def cmd_run(args):
 
 
 def cmd_optimize(args):
-    """Run CloudflareSpeedTest, pick best IP, update config with rollback support."""
+    """Run CloudflareSpeedTest, pick best IP, update config with rollback support.
+
+    DEPRECATED: Use 'run' command instead for full daemon with health monitoring
+    and automatic failover. This command is kept for quick one-shot optimization.
+    """
+    print("Warning: 'optimize' is deprecated. Use 'run' for daemon mode with failover.")
+
     if args.verify and not args.restart:
         print("Error: --verify requires --restart (need running proxy to test against)")
         sys.exit(1)
