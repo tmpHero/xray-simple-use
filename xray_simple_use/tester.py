@@ -68,7 +68,7 @@ def _test_single_ip(
     for _ in range(attempts):
         cmd = [
             _CURL_BIN,
-            "--socks5", f"127.0.0.1:{socks_port}",
+            "--socks5-hostname", f"127.0.0.1:{socks_port}",
             "-s", "-o", "/dev/null",
             "-w", "%{time_total}",
             "--max-time", str(timeout),

@@ -401,13 +401,19 @@ def save_config(config: dict, filepath: str) -> None:
     """
     Save config dict as JSON file atomically, with 0600 permissions.
 
+    Writes to tmp file, fsyncs, then atomically renames.
+    Prevents half-written config.json on crash or concurrent write.
+
     Args:
         config: Xray config dict.
         filepath: Output file path.
     """
     tmp_path = filepath + ".tmp"
-    with open(filepath, "w", encoding="utf-8") as f:
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, filepath)
     try:
         os.chmod(filepath, 0o600)
     except OSError:

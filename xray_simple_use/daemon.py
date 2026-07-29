@@ -155,6 +155,7 @@ class Daemon:
         today = datetime.now().strftime("%Y-%m-%d")
         now = datetime.now()
         if now.hour == _RESET_HOUR and today != self.last_rescan_date:
+            self.last_rescan_date = today  # Prevent re-triggering within same hour
             log.info("[SCHEDULE] Daily rescan triggered (5am).")
             threading.Thread(target=lambda: self._request_scan("daily 5am"), daemon=True).start()
 
@@ -286,9 +287,15 @@ class Daemon:
             log.error(f"[CFST] Proxy interference: {msg}")
             return
 
-        valid = filter_valid_ips(cfst_results)
-        if not valid and not emergency:
+        # Filter: when skip_download is on, only check loss_rate
+        valid = [
+            r for r in cfst_results
+            if r.received > 0 and r.loss_rate == 0.0 and r.download_speed >= 0.0
+        ]
+        if not valid:
+            # Fallback: at least received packets, zero loss
             valid = [r for r in cfst_results if r.received > 0 and r.loss_rate == 0.0]
+
         top_ips = [r.ip for r in valid[:5]]
 
         if len(top_ips) < 2 and not emergency:
@@ -333,28 +340,86 @@ class Daemon:
     # ── Recovery check ────────────────────────────────────────────────
 
     def _recovery_check(self):
-        """Probe IPs whose cooldown has expired with a single connection attempt."""
+        """Probe IPs whose cooldown has expired with a real connectivity test."""
         if not self.queue:
             return
 
         now = time.time()
         for c in self.queue.candidates:
-            if 0 < c.circuit_broken_until <= now:
-                log.info(f"[RECOVERY] Cooldown expired for {c.ip}, clearing for next candidate update.")
-                # Don't blindly clear — mark as probation.
-                # The IP will be re-tested in the next candidate_update scan.
-                # For now, just clear cooldown so it can be selected by failover
-                # if needed before the next scan.
+            if not (0 < c.circuit_broken_until <= now):
+                continue
+
+            log.info(f"[RECOVERY] Cooldown expired for {c.ip}, probing ...")
+
+            # Build a temporary config with just this IP as a test outbound
+            from xray_simple_use.vless import generate_test_config
+            test_cfg = generate_test_config(self.cfg, [c.ip], test_base_port=11901)
+
+            # Start temp xray and probe
+            import json, tempfile, subprocess
+            from xray_simple_use.xray import _get_xray_binary
+            xray_bin = _get_xray_binary()
+            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+            json.dump(test_cfg, tmp, indent=2, ensure_ascii=False)
+            tmp.close()
+
+            probe_ok = False
+            try:
+                proc = subprocess.Popen(
+                    [str(xray_bin), "run", "-c", tmp.name],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                time.sleep(0.5)
+                if proc.poll() is not None:
+                    log.warning(f"[RECOVERY] {c.ip} test xray failed to start.")
+                else:
+                    # Quick probe through SOCKS5
+                    import subprocess as sp
+                    curl_result = sp.run(
+                        ["curl", "--socks5-hostname", "127.0.0.1:11901",
+                         "--fail", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                         "--max-time", "5", "https://www.google.com"],
+                        capture_output=True, text=True, timeout=8,
+                    )
+                    if curl_result.returncode == 0:
+                        probe_ok = True
+                        log.info(f"[RECOVERY] {c.ip} probe OK, restoring to candidate pool.")
+                    else:
+                        log.warning(f"[RECOVERY] {c.ip} still failing, extending cooldown.")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            except Exception as e:
+                log.warning(f"[RECOVERY] {c.ip} probe error: {e}")
+            finally:
+                from pathlib import Path
+                Path(tmp.name).unlink(missing_ok=True)
+
+            if probe_ok:
                 c.circuit_broken_until = 0.0
-                save_queue(self.queue)
-                log.info(f"[RECOVERY] {c.ip} cooldown cleared, available for failover.")
+            else:
+                c.circuit_broken_until = now + _CIRCUIT_COOLDOWN
+            save_queue(self.queue)
 
     # ── Hot switch helper ───────────────────────────────────────────
 
     def _switch_active_ip(self, new_ip: str):
-        """Update config and gracefully restart xray."""
+        """Update config and restart xray with rollback on failure."""
         config = load_config(str(_CONFIG_FILE))
         old_ip = config["outbounds"][0]["settings"]["vnext"][0]["address"]
+
+        if old_ip == new_ip:
+            return
+
+        # Backup
+        import json
+        backup_config = json.dumps(config)
+        backup_active = old_ip
+
+        # Update config
         config["outbounds"][0]["settings"]["vnext"][0]["address"] = new_ip
         save_config(config, str(_CONFIG_FILE))
 
@@ -362,4 +427,16 @@ class Daemon:
             restart_xray(config)
             log.info(f"[SWITCH] Active IP: {old_ip} → {new_ip}")
         except RuntimeError as e:
-            log.error(f"[SWITCH] Restart failed: {e}")
+            log.error(f"[SWITCH] Restart failed: {e}, rolling back.")
+            # Rollback config
+            save_config(json.loads(backup_config), str(_CONFIG_FILE))
+            # Rollback queue
+            if self.queue:
+                self.queue.active_ip = backup_active
+                save_queue(self.queue)
+            # Try to restart with old config
+            try:
+                start_xray(config=json.loads(backup_config))
+                log.info(f"[SWITCH] Rollback successful, restored {old_ip}.")
+            except RuntimeError:
+                log.critical("[SWITCH] Rollback restart also failed — proxy may be down.")
