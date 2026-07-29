@@ -15,12 +15,13 @@ from typing import Optional
 
 from xray_simple_use.vless import VLESSConfig, generate_test_config
 from xray_simple_use.xray import _get_xray_binary, _CONFIG_FILE
+from xray_simple_use.speedtest import probe_socks, ProbeResult
 
-_CURL_BIN = "curl"
 _TEST_URL = "https://www.google.com"
 _DEFAULT_ATTEMPTS = 3
 _DEFAULT_TIMEOUT = 8
 _TEST_BASE_PORT = 11001
+_EXPECTED_STATUS = 204
 
 
 @dataclass
@@ -47,15 +48,17 @@ def _test_single_ip(
     test_url: str = _TEST_URL,
     attempts: int = _DEFAULT_ATTEMPTS,
     timeout: int = _DEFAULT_TIMEOUT,
+    expected_status: int = _EXPECTED_STATUS,
 ) -> tuple[int, int, int, list[float]]:
     """
-    Test a single IP through its dedicated SOCKS5 port.
+    Test a single IP through its dedicated SOCKS5 port using unified probe_socks.
 
     Args:
         socks_port: SOCKS5 port for this candidate.
         test_url: URL to request.
         attempts: Number of test requests.
         timeout: Per-request timeout in seconds.
+        expected_status: Expected HTTP status code.
 
     Returns:
         Tuple of (success_count, failure_count, timeout_count, latencies_ms).
@@ -66,35 +69,14 @@ def _test_single_ip(
     latencies: list[float] = []
 
     for _ in range(attempts):
-        cmd = [
-            _CURL_BIN,
-            "--socks5-hostname", f"127.0.0.1:{socks_port}",
-            "--fail",
-            "-s", "-o", "/dev/null",
-            "-w", "%{http_code}\n%{time_total}",
-            "--max-time", str(timeout),
-            test_url,
-        ]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 3)
-            if proc.returncode == 0:
-                # Parse http_code and time_total
-                lines = proc.stdout.strip().split("\n")
-                http_code = lines[0].strip() if lines else ""
-                if http_code not in ("204", "200"):
-                    failure += 1
-                    continue
-                try:
-                    lat = float(lines[1].strip()) * 1000
-                except (IndexError, ValueError):
-                    lat = 0.0
-                success += 1
-                latencies.append(lat)
-            else:
-                failure += 1
-        except subprocess.TimeoutExpired:
+        result = probe_socks(socks_port, test_url, expected_status, timeout)
+        if result.ok:
+            success += 1
+            if result.total_time_ms is not None:
+                latencies.append(result.total_time_ms)
+        elif result.error == "timeout":
             timeout_cnt += 1
-        except Exception:
+        else:
             failure += 1
 
     return success, failure, timeout_cnt, latencies

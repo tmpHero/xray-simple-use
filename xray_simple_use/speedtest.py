@@ -2,6 +2,7 @@
 Test proxy connectivity, latency, and download speed through SOCKS5 proxy.
 """
 
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -16,6 +17,77 @@ _DEFAULT_TEST_URLS = [
 _SPEED_TEST_URL = "http://speedtest.tele2.net/100MB.zip"
 
 _CURL_BIN = "curl"
+
+
+@dataclass
+class ProbeResult:
+    """Unified proxy probe result."""
+    ok: bool
+    http_status: Optional[int] = None
+    total_time_ms: Optional[float] = None
+    error: Optional[str] = None
+
+
+def probe_socks(
+    socks_port: int,
+    url: str,
+    expected_status: int = 204,
+    timeout: int = 5,
+) -> ProbeResult:
+    """
+    Probe a URL through SOCKS5 proxy — unified for health check,
+    candidate testing, and recovery verification.
+
+    Args:
+        socks_port: SOCKS5 proxy port.
+        url: URL to request.
+        expected_status: HTTP status code expected for success.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        ProbeResult with ok, http_status, total_time_ms, error.
+    """
+    cmd = [
+        _CURL_BIN,
+        "--socks5-hostname", f"127.0.0.1:{socks_port}",
+        "--silent", "--show-error",
+        "--max-time", str(timeout),
+        "--output", os.devnull,
+        "--write-out", "%{http_code},%{time_total}",
+        url,
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+
+        if proc.returncode != 0:
+            return ProbeResult(
+                ok=False,
+                http_status=None,
+                total_time_ms=None,
+                error=proc.stderr.strip() or f"curl exit {proc.returncode}",
+            )
+
+        parts = proc.stdout.strip().split(",", 1)
+        if len(parts) != 2:
+            return ProbeResult(ok=False, error=f"unexpected curl output: {proc.stdout.strip()}")
+
+        http_code = int(parts[0].strip())
+        time_ms = float(parts[1].strip()) * 1000
+
+        return ProbeResult(
+            ok=http_code == expected_status,
+            http_status=http_code,
+            total_time_ms=time_ms,
+            error=None if http_code == expected_status else f"HTTP {http_code}",
+        )
+
+    except subprocess.TimeoutExpired:
+        return ProbeResult(ok=False, error="timeout")
+    except (ValueError, TypeError) as e:
+        return ProbeResult(ok=False, error=f"parse error: {e}")
+    except Exception as e:
+        return ProbeResult(ok=False, error=str(e))
 
 
 @dataclass

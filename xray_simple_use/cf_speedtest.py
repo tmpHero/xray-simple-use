@@ -260,24 +260,52 @@ def _parse_result_csv(csv_path: str) -> list[IPResult]:
 
 
 def filter_valid_ips(results: list[IPResult]) -> list[IPResult]:
+    """DEPRECATED: use filter_cfst_results instead."""
+    return filter_cfst_results(results, skip_download=True, max_loss_rate=0.0)
+
+
+def filter_cfst_results(
+    results: list[IPResult],
+    *,
+    skip_download: bool = True,
+    max_loss_rate: float = 0.0,
+    max_latency_ms: float = 0.0,
+) -> list[IPResult]:
     """
-    Filter results: must have no packet loss and non-zero download speed.
+    Filter CFST results by received, loss rate, latency, and optionally download speed.
+
+    When skip_download is True, download_speed is not checked (CFST returns 0 with -dd).
+    When False, download_speed must be > 0.
 
     Args:
-        results: Raw IPResult list from parse.
+        results: Raw IPResult list from CFST.
+        skip_download: Whether CFST was run with -dd (skip download speed test).
+        max_loss_rate: Maximum acceptable loss rate (0.0 = no loss).
+        max_latency_ms: Maximum acceptable latency (0 = no limit).
 
     Returns:
         Filtered list sorted by latency.
     """
-    valid = [
-        r for r in results
-        if r.received > 0
-        and r.loss_rate == 0.0
-        and r.download_speed > 0.0
-    ]
+    valid: list[IPResult] = []
+
+    for r in results:
+        if r.received <= 0:
+            continue
+        if r.loss_rate > max_loss_rate:
+            continue
+        if r.latency <= 0:
+            continue
+        if max_latency_ms > 0 and r.latency > max_latency_ms:
+            continue
+        if not skip_download and r.download_speed <= 0:
+            continue
+        valid.append(r)
+
     if not valid:
-        # Fallback: at least require received packets
-        valid = [r for r in results if r.received > 0]
+        # Fallback: at least require received packets and zero loss
+        valid = [r for r in results if r.received > 0 and r.loss_rate == 0.0]
+
+    valid.sort(key=lambda r: r.latency)
     return valid
 
 

@@ -55,8 +55,11 @@ from xray_simple_use.queue import (
 )
 from xray_simple_use.speedtest import (
     test_connectivity,
+    probe_socks,
+    ProbeResult,
 )
 from xray_simple_use.config import Config
+from xray_simple_use.cf_speedtest import filter_cfst_results
 
 logging.basicConfig(
     level=logging.INFO,
@@ -172,16 +175,17 @@ class Daemon:
 
     def _health_check(self) -> bool:
         """Check if current proxy responds with expected HTTP status."""
-        result = test_connectivity(
+        result = probe_socks(
             socks_port=self._socks_port,
-            test_url=self.app_config.probe_url,
+            url=self.app_config.probe_url,
+            expected_status=self.app_config.expected_http_status,
             timeout=_HEALTH_TIMEOUT,
         )
-        if result.connected:
-            log.debug(f"[HEALTH] OK ({result.latency_ms}ms)")
+        if result.ok:
+            log.debug(f"[HEALTH] OK ({result.total_time_ms:.0f}ms)")
         else:
             log.warning(f"[HEALTH] FAIL: {result.error}")
-        return result.connected
+        return result.ok
 
     # ── Failover ────────────────────────────────────────────────────
 
@@ -211,17 +215,31 @@ class Daemon:
             # ── 0 available ──
             if available == 0:
                 log.error("[FAILOVER] All IPs in cooldown.")
-                fallback = get_shortest_cooldown_ip(self.queue)
-                if fallback:
-                    log.warning(f"[FAILOVER] Trying fallback: {fallback}")
-                    clear_cooldown(self.queue, fallback)
-                    self.queue.active_ip = fallback
+                # Choose best historical candidate (not just shortest cooldown)
+                sorted_candidates = sorted(
+                    self.queue.candidates,
+                    key=lambda c: (c.failures, -c.success_rate, c.median_latency_ms, c.circuit_broken_until),
+                )
+                fallback_ip = None
+                for c in sorted_candidates:
+                    log.info(f"[FAILOVER] Probing fallback {c.ip} before use ...")
+                    if self._probe_candidate(c.ip):
+                        fallback_ip = c.ip
+                        log.warning(f"[FAILOVER] {c.ip} probe OK, activating.")
+                        break
+                    else:
+                        c.circuit_broken_until = time.time() + self.app_config.cooldown_seconds
+                        log.warning(f"[FAILOVER] {c.ip} probe failed, extending cooldown.")
+
+                if fallback_ip:
+                    clear_cooldown(self.queue, fallback_ip)
+                    self.queue.active_ip = fallback_ip
                     save_queue(self.queue)
-                    switch_ip = fallback
+                    self._switch_active_ip(fallback_ip)
                 else:
-                    switch_ip = None
-                if switch_ip:
-                    self._switch_active_ip(switch_ip)
+                    log.critical("[FAILOVER] No fallback passed probe — proxy offline.")
+                    save_queue(self.queue)
+
                 threading.Thread(target=lambda: self._request_scan("emergency-all-dead", emergency=True), daemon=True).start()
                 self.fail_count = 0
                 return
@@ -261,168 +279,191 @@ class Daemon:
             self._scan_lock.release()
 
     def _do_scan(self, emergency: bool = False):
-        """Full CFST scan + real-link test + queue update."""
+        """Full CFST scan + real-link test + transactional queue update."""
         import xray_simple_use.cf_speedtest as cfst_mod
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         custom_csv = cfst_mod._PROJECT_ROOT / f"cfst_result_{ts}.csv"
 
-        # CFST coarse scan
-        old_csv = cfst_mod._RESULT_CSV
-        cfst_mod._RESULT_CSV = custom_csv
         try:
-            cfst_results = run_speedtest(
-                concurrency=self.app_config.cfst_concurrency,
-                attempts=self.app_config.cfst_attempts,
-                test_port=self.cfg.port,
-                skip_download=self.app_config.skip_download,
-                max_delay=self.app_config.max_latency_ms,
-            )
-        finally:
-            cfst_mod._RESULT_CSV = old_csv
+            # CFST coarse scan
+            old_csv = cfst_mod._RESULT_CSV
+            cfst_mod._RESULT_CSV = custom_csv
+            try:
+                cfst_results = run_speedtest(
+                    concurrency=self.app_config.cfst_concurrency,
+                    attempts=self.app_config.cfst_attempts,
+                    test_port=self.cfg.port,
+                    skip_download=self.app_config.skip_download,
+                    max_delay=self.app_config.max_latency_ms,
+                )
+            finally:
+                cfst_mod._RESULT_CSV = old_csv
 
-        is_clean, msg = check_proxy_interference(cfst_results)
-        if not is_clean:
-            log.error(f"[CFST] Proxy interference: {msg}")
-            return
-
-        # Filter: when skip_download is on, only check loss_rate
-        valid = [
-            r for r in cfst_results
-            if r.received > 0 and r.loss_rate == 0.0 and r.download_speed >= 0.0
-        ]
-        if not valid:
-            valid = [r for r in cfst_results if r.received > 0 and r.loss_rate == 0.0]
-
-        top_ips = [r.ip for r in valid[:self.app_config.candidate_count]]
-
-        if len(top_ips) < 2 and not emergency:
-            log.warning(f"[CFST] Only {len(top_ips)} valid IPs, need >= 2.")
-            if not top_ips:
+            is_clean, msg = check_proxy_interference(cfst_results)
+            if not is_clean:
+                log.error(f"[CFST] Proxy interference: {msg}")
                 return
 
-        log.info(f"[CFST] Got {len(cfst_results)} IPs, top {len(top_ips)}: {top_ips}")
-
-        # Real-link test
-        test_results = test_candidates(
-            self.cfg, top_ips,
-            test_url=self.app_config.probe_url,
-            attempts=self.app_config.test_attempts,
-            timeout=self.app_config.test_timeout_seconds,
-        )
-
-        for r in test_results:
-            log.info(
-                f"[TEST] {r.ip}: {r.success_count}/{r.success_count + r.failure_count + r.timeout_count} "
-                f"success, median={r.median_latency:.0f}ms, p95={r.p95_latency:.0f}ms"
+            valid = filter_cfst_results(
+                cfst_results,
+                skip_download=self.app_config.skip_download,
+                max_loss_rate=self.app_config.max_loss_rate,
+                max_latency_ms=self.app_config.max_latency_ms,
             )
 
-        # Build queue (only qualified candidates)
-        queue_data = results_to_queue_data(test_results)
-        new_queue = build_queue(queue_data)
+            top_ips = [r.ip for r in valid[:self.app_config.candidate_count]]
 
-        if not new_queue.candidates:
-            log.warning("[QUEUE] No qualified candidates after testing, keeping old queue.")
-            return
+            if len(top_ips) < 2 and not emergency:
+                log.warning(f"[CFST] Only {len(top_ips)} valid IPs.")
+                if not top_ips:
+                    return
 
-        # Compare with actual xray config address (not old queue.active_ip)
-        current_xray_addr = ""
-        try:
-            current_config = load_config(str(_CONFIG_FILE))
-            current_xray_addr = current_config["outbounds"][0]["settings"]["vnext"][0]["address"]
-        except Exception:
-            pass
+            log.info(f"[CFST] Got {len(cfst_results)} IPs, top {len(top_ips)}: {top_ips}")
 
-        need_switch = (
-            (current_xray_addr and current_xray_addr != new_queue.active_ip)
-            or not self.queue
-            or not self.queue.active_ip
-        )
+            # Real-link test
+            test_results = test_candidates(
+                self.cfg, top_ips,
+                test_url=self.app_config.probe_url,
+                attempts=self.app_config.test_attempts,
+                timeout=self.app_config.test_timeout_seconds,
+            )
 
-        # Transaction: switch xray first, then save queue
-        switched = False
-        if need_switch:
-            switched = self._switch_active_ip(new_queue.active_ip)
+            for r in test_results:
+                log.info(
+                    f"[TEST] {r.ip}: {r.success_count}/{r.success_count + r.failure_count + r.timeout_count} "
+                    f"success, median={r.median_latency:.0f}ms, p95={r.p95_latency:.0f}ms"
+                )
 
-        with self._queue_lock:
-            self.queue = new_queue
-            if not switched and need_switch:
-                # Switch failed — but we still update queue metadata.
-                # The active_ip mismatch will be corrected on next scan.
-                log.warning("[QUEUE] Switch failed, queue saved but xray may not match.")
-            save_queue(self.queue)
-            log.info(f"[QUEUE] Updated: active={new_queue.active_ip}, candidates={[c.ip for c in new_queue.candidates]}")
+            queue_data = results_to_queue_data(test_results)
+            new_queue = build_queue(queue_data)
 
-        # Cleanup temp CSV
-        custom_csv.unlink(missing_ok=True)
+            if not new_queue.candidates:
+                log.warning("[QUEUE] No qualified candidates, keeping old queue.")
+                return
+
+            # Snapshot old queue for potential rollback
+            import copy
+            with self._queue_lock:
+                old_queue_snapshot = copy.deepcopy(self.queue) if self.queue else None
+
+            # Compare with actual xray config address
+            current_xray_addr = ""
+            try:
+                current_config = load_config(str(_CONFIG_FILE))
+                current_xray_addr = current_config["outbounds"][0]["settings"]["vnext"][0]["address"]
+            except Exception:
+                pass
+
+            need_switch = (
+                (current_xray_addr and current_xray_addr != new_queue.active_ip)
+                or not self.queue
+                or not self.queue.active_ip
+            )
+
+            # Transaction: switch first, then commit queue
+            if need_switch:
+                switched = self._switch_active_ip(new_queue.active_ip)
+            else:
+                switched = True
+
+            with self._queue_lock:
+                if switched:
+                    self.queue = new_queue
+                    save_queue(self.queue)
+                    log.info(f"[QUEUE] Updated: active={new_queue.active_ip}, "
+                             f"candidates={[c.ip for c in new_queue.candidates]}")
+                elif old_queue_snapshot:
+                    # Switch failed, restore old queue entirely
+                    self.queue = old_queue_snapshot
+                    save_queue(self.queue)
+                    log.warning("[QUEUE] Switch failed, restored old queue.")
+                else:
+                    self.queue = new_queue
+                    save_queue(self.queue)
+
+        finally:
+            custom_csv.unlink(missing_ok=True)
 
     # ── Recovery check ────────────────────────────────────────────────
 
     # ── Recovery loop (background thread) ──────────────────────────────
 
     def _recovery_loop(self):
-        """Background thread: periodically probe IPs whose cooldown has expired."""
+        """Background thread: snapshot targets, probe outside lock, commit inside lock."""
         while not self._recovery_stop.wait(timeout=self.app_config.health_interval):
-            if not self.queue:
-                continue
-            now = time.time()
-            for c in self.queue.candidates:
-                if not (0 < c.circuit_broken_until <= now):
+            # Lock: get snapshot of expired IPs
+            with self._queue_lock:
+                if not self.queue:
                     continue
+                now = time.time()
+                targets = [
+                    c.ip for c in self.queue.candidates
+                    if 0 < c.circuit_broken_until <= now
+                ]
 
-                log.info(f"[RECOVERY] Cooldown expired for {c.ip}, probing ...")
-                from xray_simple_use.vless import generate_test_config
-                test_cfg = generate_test_config(self.cfg, [c.ip], test_base_port=11901)
+            for ip in targets:
+                log.info(f"[RECOVERY] Probing {ip} ...")
+                recovered = self._probe_candidate(ip)
 
-                import json, tempfile, subprocess as sp
-                from xray_simple_use.xray import _get_xray_binary
-                from pathlib import Path as P
-
-                xray_bin = _get_xray_binary()
-                tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
-                json.dump(test_cfg, tmp, indent=2, ensure_ascii=False)
-                tmp.close()
-
-                probe_ok = False
-                try:
-                    proc = sp.Popen(
-                        [str(xray_bin), "run", "-c", tmp.name],
-                        stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+                # Lock: commit result against current queue
+                with self._queue_lock:
+                    if not self.queue:
+                        continue
+                    candidate = next(
+                        (c for c in self.queue.candidates if c.ip == ip), None
                     )
-                    time.sleep(0.5)
-                    if proc.poll() is not None:
-                        log.warning(f"[RECOVERY] {c.ip} test xray failed to start.")
-                    else:
-                        curl_result = sp.run(
-                            ["curl", "--socks5-hostname", "127.0.0.1:11901",
-                             "--fail", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                             "--max-time", "5", self.app_config.probe_url],
-                            capture_output=True, text=True, timeout=8,
-                        )
-                        http_code = curl_result.stdout.strip()
-                        probe_ok = (
-                            curl_result.returncode == 0
-                            and http_code in ("204", "200")
-                        )
-                        if probe_ok:
-                            log.info(f"[RECOVERY] {c.ip} probe OK (HTTP {http_code}), restored.")
-                        else:
-                            log.warning(f"[RECOVERY] {c.ip} still failing (code={http_code}), extending cooldown.")
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except sp.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
-                except Exception as e:
-                    log.warning(f"[RECOVERY] {c.ip} probe error: {e}")
-                finally:
-                    P(tmp.name).unlink(missing_ok=True)
+                    if candidate is None:
+                        continue
 
-                if probe_ok:
-                    c.circuit_broken_until = 0.0
-                else:
-                    c.circuit_broken_until = now + self.app_config.cooldown_seconds
-                save_queue(self.queue)
+                    if recovered:
+                        candidate.circuit_broken_until = 0.0
+                        log.info(f"[RECOVERY] {ip} OK, restored to pool.")
+                    else:
+                        candidate.circuit_broken_until = now + self.app_config.cooldown_seconds
+                        log.warning(f"[RECOVERY] {ip} still failing, cooldown extended.")
+                    save_queue(self.queue)
+
+    def _probe_candidate(self, ip: str) -> bool:
+        """Probe a single candidate IP via temporary xray + probe_socks. Returns True if OK."""
+        import json, tempfile, subprocess as sp
+        from xray_simple_use.vless import generate_test_config
+        from xray_simple_use.xray import _get_xray_binary
+        from pathlib import Path as P
+
+        test_cfg = generate_test_config(self.cfg, [ip], test_base_port=11901)
+        xray_bin = _get_xray_binary()
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+        json.dump(test_cfg, tmp, indent=2, ensure_ascii=False)
+        tmp.close()
+
+        try:
+            proc = sp.Popen(
+                [str(xray_bin), "run", "-c", tmp.name],
+                stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+            )
+            time.sleep(0.5)
+            if proc.poll() is not None:
+                return False
+
+            result = probe_socks(
+                socks_port=11901,
+                url=self.app_config.probe_url,
+                expected_status=self.app_config.expected_http_status,
+                timeout=5,
+            )
+            ok = result.ok
+        except Exception:
+            ok = False
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except sp.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            P(tmp.name).unlink(missing_ok=True)
+
+        return ok
 
     # ── Hot switch helper ───────────────────────────────────────────
 

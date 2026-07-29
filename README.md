@@ -7,6 +7,9 @@
 - Python 3.10+ (via [uv](https://docs.astral.sh/uv/))
 - Linux x86_64
 
+> **注意：当前版本在切换 IP 时会重启 Xray，正在进行的下载、上传、SSH 等连接会中断。**
+> 多 outbound 平滑切换功能尚未实现。
+
 ## 快速开始
 
 ```bash

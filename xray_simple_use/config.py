@@ -51,6 +51,10 @@ class Config:
     test_attempts: int = 3
     test_timeout_seconds: int = 5
     probe_url: str = "https://www.gstatic.com/generate_204"
+    expected_http_status: int = 204
+
+    # [cfst] extended
+    max_loss_rate: float = 0.0
 
 
 def load_ini(path: Optional[Path] = None) -> Config:
@@ -108,10 +112,12 @@ def load_ini(path: Optional[Path] = None) -> Config:
         candidate_count=parser.getint("cfst", "candidate_count", fallback=5),
         skip_download=parser.getboolean("cfst", "skip_download", fallback=True),
         max_latency_ms=parser.getint("cfst", "max_latency_ms", fallback=500),
+        max_loss_rate=parser.getfloat("cfst", "max_loss_rate", fallback=0.0),
 
         test_attempts=parser.getint("test", "attempts", fallback=3),
         test_timeout_seconds=parser.getint("test", "timeout_seconds", fallback=5),
         probe_url=parser.get("test", "probe_url", fallback="https://www.gstatic.com/generate_204"),
+        expected_http_status=parser.getint("test", "expected_http_status", fallback=204),
     )
 
     _validate_config(cfg)
@@ -142,8 +148,8 @@ def _validate_config(cfg: Config) -> None:
         errors.append(f"cfst_concurrency must be 1-1000, got {cfg.cfst_concurrency}")
     if cfg.cfst_attempts < 1:
         errors.append(f"cfst_attempts must be >= 1, got {cfg.cfst_attempts}")
-    if cfg.test_attempts < 1:
-        errors.append(f"test_attempts must be >= 1, got {cfg.test_attempts}")
+    if cfg.test_attempts < 3:
+        errors.append(f"test_attempts must be >= 3 (required for candidate qualification), got {cfg.test_attempts}")
     if cfg.test_timeout_seconds < 1:
         errors.append(f"test_timeout_seconds must be >= 1, got {cfg.test_timeout_seconds}")
 
