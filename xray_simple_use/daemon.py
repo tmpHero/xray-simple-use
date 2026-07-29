@@ -81,6 +81,7 @@ class Daemon:
         self._socks_port = 10808
         self._http_port = 10809
         self._scan_lock = threading.Lock()
+        self._queue_lock = threading.RLock()
         self._recovery_stop = threading.Event()
 
     def run(self):
@@ -186,59 +187,62 @@ class Daemon:
 
     def _failover(self):
         """Switch to next available candidate, with graded rescan triggers."""
-        if not self.queue or not self.queue.candidates:
-            log.error("[FAILOVER] No queue available, triggering emergency scan.")
-            threading.Thread(target=lambda: self._request_scan("emergency", emergency=True), daemon=True).start()
-            return
+        with self._queue_lock:
+            if not self.queue or not self.queue.candidates:
+                log.error("[FAILOVER] No queue available, triggering emergency scan.")
+                threading.Thread(target=lambda: self._request_scan("emergency", emergency=True), daemon=True).start()
+                return
 
-        failed_ip = self.queue.active_ip
-        # Exponential cooldown based on failure count
-        current_failures = 0
-        for c in self.queue.candidates:
-            if c.ip == failed_ip:
-                current_failures = c.failures
-                break
-        cooldown = min(self.app_config.cooldown_seconds * (2 ** current_failures), self.app_config.max_cooldown_seconds)
-        mark_failed(self.queue, failed_ip, cooldown)
-        log.warning(f"[FAILOVER] Marked {failed_ip} as failed (cooldown={cooldown}s).")
+            failed_ip = self.queue.active_ip
+            current_failures = 0
+            for c in self.queue.candidates:
+                if c.ip == failed_ip:
+                    current_failures = c.failures
+                    break
+            cooldown = min(self.app_config.cooldown_seconds * (2 ** current_failures), self.app_config.max_cooldown_seconds)
+            mark_failed(self.queue, failed_ip, cooldown)
+            log.warning(f"[FAILOVER] Marked {failed_ip} as failed (cooldown={cooldown}s).")
 
-        available = count_available(self.queue)
-        log.info(f"[FAILOVER] Available IPs after marking: {available}/{len(self.queue.candidates)}")
+            available = count_available(self.queue)
+            log.info(f"[FAILOVER] Available IPs after marking: {available}/{len(self.queue.candidates)}")
 
-        next_ip = get_next_available(self.queue, failed_ip)
+            next_ip = get_next_available(self.queue, failed_ip)
 
-        # ── 0 available ──
-        if available == 0:
-            log.error("[FAILOVER] All IPs in cooldown.")
-            fallback = get_shortest_cooldown_ip(self.queue)
-            if fallback:
-                log.warning(f"[FAILOVER] Trying fallback: {fallback}")
-                clear_cooldown(self.queue, fallback)
-                self.queue.active_ip = fallback
+            # ── 0 available ──
+            if available == 0:
+                log.error("[FAILOVER] All IPs in cooldown.")
+                fallback = get_shortest_cooldown_ip(self.queue)
+                if fallback:
+                    log.warning(f"[FAILOVER] Trying fallback: {fallback}")
+                    clear_cooldown(self.queue, fallback)
+                    self.queue.active_ip = fallback
+                    save_queue(self.queue)
+                    switch_ip = fallback
+                else:
+                    switch_ip = None
+                if switch_ip:
+                    self._switch_active_ip(switch_ip)
+                threading.Thread(target=lambda: self._request_scan("emergency-all-dead", emergency=True), daemon=True).start()
+                self.fail_count = 0
+                return
+
+            # ── 1 available: emergency ──
+            if available <= self.app_config.emergency_threshold:
+                log.warning(f"[FAILOVER] Only {available} IP(s) left, triggering emergency CFST.")
+                threading.Thread(target=lambda: self._request_scan("emergency", emergency=True), daemon=True).start()
+            # ── warning threshold ──
+            elif available <= self.app_config.replenish_threshold:
+                log.warning(f"[FAILOVER] Only {available} IPs left, starting background supplement.")
+                threading.Thread(target=lambda: self._request_scan("warning"), daemon=True).start()
+
+            if next_ip:
+                self.queue.active_ip = next_ip
                 save_queue(self.queue)
-                self._switch_active_ip(fallback)
-            threading.Thread(target=lambda: self._request_scan("emergency-all-dead", emergency=True), daemon=True).start()
-            self.fail_count = 0
-            return
-
-        # ── 1 available: emergency ──
-        if available <= self.app_config.emergency_threshold:
-            log.warning(f"[FAILOVER] Only {available} IP(s) left, triggering emergency CFST.")
-            threading.Thread(target=lambda: self._request_scan("emergency", emergency=True), daemon=True).start()
-
-        # ── warning threshold ──
-        elif available <= self.app_config.replenish_threshold:
-            log.warning(f"[FAILOVER] Only {available} IPs left, starting background supplement.")
-            threading.Thread(target=lambda: self._request_scan("warning"), daemon=True).start()
-
-        if next_ip:
-            self.queue.active_ip = next_ip
-            save_queue(self.queue)
-            self._switch_active_ip(next_ip)
-            self.fail_count = 0
-        else:
-            log.error("[FAILOVER] Unexpected: no next IP despite available > 0.")
-            threading.Thread(target=lambda: self._request_scan("emergency-unexpected", emergency=True), daemon=True).start()
+                self._switch_active_ip(next_ip)
+                self.fail_count = 0
+            else:
+                log.error("[FAILOVER] Unexpected: no next IP despite available > 0.")
+                threading.Thread(target=lambda: self._request_scan("emergency-unexpected", emergency=True), daemon=True).start()
 
     # ── Unified scan entry ──────────────────────────────────────────
 
@@ -301,6 +305,7 @@ class Daemon:
         # Real-link test
         test_results = test_candidates(
             self.cfg, top_ips,
+            test_url=self.app_config.probe_url,
             attempts=self.app_config.test_attempts,
             timeout=self.app_config.test_timeout_seconds,
         )
@@ -327,16 +332,25 @@ class Daemon:
         except Exception:
             pass
 
-        old_active = self.queue.active_ip if self.queue else ""
-        self.queue = new_queue
-        save_queue(self.queue)
-        log.info(f"[QUEUE] Updated: active={new_queue.active_ip}, candidates={[c.ip for c in new_queue.candidates]}")
+        need_switch = (
+            (current_xray_addr and current_xray_addr != new_queue.active_ip)
+            or not self.queue
+            or not self.queue.active_ip
+        )
 
-        if current_xray_addr and current_xray_addr != new_queue.active_ip:
-            self._switch_active_ip(new_queue.active_ip)
-        elif not old_active:
-            # First scan: always ensure xray matches queue
-            self._switch_active_ip(new_queue.active_ip)
+        # Transaction: switch xray first, then save queue
+        switched = False
+        if need_switch:
+            switched = self._switch_active_ip(new_queue.active_ip)
+
+        with self._queue_lock:
+            self.queue = new_queue
+            if not switched and need_switch:
+                # Switch failed — but we still update queue metadata.
+                # The active_ip mismatch will be corrected on next scan.
+                log.warning("[QUEUE] Switch failed, queue saved but xray may not match.")
+            save_queue(self.queue)
+            log.info(f"[QUEUE] Updated: active={new_queue.active_ip}, candidates={[c.ip for c in new_queue.candidates]}")
 
         # Cleanup temp CSV
         custom_csv.unlink(missing_ok=True)
@@ -384,11 +398,15 @@ class Daemon:
                              "--max-time", "5", self.app_config.probe_url],
                             capture_output=True, text=True, timeout=8,
                         )
-                        if curl_result.returncode == 0:
-                            probe_ok = True
-                            log.info(f"[RECOVERY] {c.ip} probe OK, restored to pool.")
+                        http_code = curl_result.stdout.strip()
+                        probe_ok = (
+                            curl_result.returncode == 0
+                            and http_code in ("204", "200")
+                        )
+                        if probe_ok:
+                            log.info(f"[RECOVERY] {c.ip} probe OK (HTTP {http_code}), restored.")
                         else:
-                            log.warning(f"[RECOVERY] {c.ip} still failing, extending cooldown.")
+                            log.warning(f"[RECOVERY] {c.ip} still failing (code={http_code}), extending cooldown.")
                     proc.terminate()
                     try:
                         proc.wait(timeout=5)
@@ -408,18 +426,20 @@ class Daemon:
 
     # ── Hot switch helper ───────────────────────────────────────────
 
-    def _switch_active_ip(self, new_ip: str):
-        """Update config and restart xray with rollback on failure."""
+    def _switch_active_ip(self, new_ip: str) -> bool:
+        """Update config and restart xray with rollback on failure.
+
+        Returns True on success, False on failure (after rollback).
+        """
         config = load_config(str(_CONFIG_FILE))
         old_ip = config["outbounds"][0]["settings"]["vnext"][0]["address"]
 
         if old_ip == new_ip:
-            return
+            return True
 
         # Backup
         import json
         backup_config = json.dumps(config)
-        backup_active = old_ip
 
         # Update config
         config["outbounds"][0]["settings"]["vnext"][0]["address"] = new_ip
@@ -428,17 +448,20 @@ class Daemon:
         try:
             restart_xray(config)
             log.info(f"[SWITCH] Active IP: {old_ip} → {new_ip}")
+            return True
         except RuntimeError as e:
             log.error(f"[SWITCH] Restart failed: {e}, rolling back.")
             # Rollback config
             save_config(json.loads(backup_config), str(_CONFIG_FILE))
-            # Rollback queue
-            if self.queue:
-                self.queue.active_ip = backup_active
-                save_queue(self.queue)
+            # Rollback queue active_ip
+            with self._queue_lock:
+                if self.queue:
+                    self.queue.active_ip = old_ip
+                    save_queue(self.queue)
             # Try to restart with old config
             try:
                 start_xray(config=json.loads(backup_config))
                 log.info(f"[SWITCH] Rollback successful, restored {old_ip}.")
             except RuntimeError:
                 log.critical("[SWITCH] Rollback restart also failed — proxy may be down.")
+            return False

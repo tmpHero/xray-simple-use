@@ -92,7 +92,7 @@ def load_ini(path: Optional[Path] = None) -> Config:
     if not parser.has_option("server", "vless_url"):
         raise ValueError("Missing [server] vless_url in config file.")
 
-    return Config(
+    cfg = Config(
         vless_url=parser.get("server", "vless_url"),
 
         daily_scan_hour=parser.getint("daemon", "daily_scan_hour", fallback=5),
@@ -113,6 +113,42 @@ def load_ini(path: Optional[Path] = None) -> Config:
         test_timeout_seconds=parser.getint("test", "timeout_seconds", fallback=5),
         probe_url=parser.get("test", "probe_url", fallback="https://www.gstatic.com/generate_204"),
     )
+
+    _validate_config(cfg)
+
+    return cfg
+
+
+def _validate_config(cfg: Config) -> None:
+    """Validate config parameter ranges, raise ValueError on invalid values."""
+    errors = []
+
+    if not (0 <= cfg.daily_scan_hour <= 23):
+        errors.append(f"daily_scan_hour must be 0-23, got {cfg.daily_scan_hour}")
+    if cfg.health_interval < 5:
+        errors.append(f"health_interval must be >= 5, got {cfg.health_interval}")
+    if cfg.failure_threshold < 1:
+        errors.append(f"failure_threshold must be >= 1, got {cfg.failure_threshold}")
+    if cfg.cooldown_seconds < 30:
+        errors.append(f"cooldown_seconds must be >= 30, got {cfg.cooldown_seconds}")
+    if not (1 <= cfg.emergency_threshold <= cfg.replenish_threshold):
+        errors.append(
+            f"emergency_threshold must be >= 1 and <= replenish_threshold, "
+            f"got emergency={cfg.emergency_threshold}, replenish={cfg.replenish_threshold}"
+        )
+    if cfg.candidate_count < 2:
+        errors.append(f"candidate_count must be >= 2, got {cfg.candidate_count}")
+    if not (1 <= cfg.cfst_concurrency <= 1000):
+        errors.append(f"cfst_concurrency must be 1-1000, got {cfg.cfst_concurrency}")
+    if cfg.cfst_attempts < 1:
+        errors.append(f"cfst_attempts must be >= 1, got {cfg.cfst_attempts}")
+    if cfg.test_attempts < 1:
+        errors.append(f"test_attempts must be >= 1, got {cfg.test_attempts}")
+    if cfg.test_timeout_seconds < 1:
+        errors.append(f"test_timeout_seconds must be >= 1, got {cfg.test_timeout_seconds}")
+
+    if errors:
+        raise ValueError("Invalid config values:\n  " + "\n  ".join(errors))
 
 
 def _find_config() -> Path:
