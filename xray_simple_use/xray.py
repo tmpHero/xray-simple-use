@@ -144,6 +144,29 @@ def stop_xray() -> None:
     _PID_FILE.unlink(missing_ok=True)
 
 
+def reload_xray() -> None:
+    """
+    Send SIGHUP to xray-core for hot config reload.
+
+    Xray reloads config.json without dropping existing connections.
+    New connections use the updated config.
+
+    Raises:
+        RuntimeError: If xray is not running or signal fails.
+    """
+    if not is_running():
+        raise RuntimeError("Xray is not running, cannot reload.")
+
+    pid = int(_PID_FILE.read_text().strip())
+    try:
+        os.kill(pid, 1)  # SIGHUP
+        print(f"Xray (pid={pid}) config reloaded (SIGHUP).")
+    except ProcessLookupError:
+        raise RuntimeError(f"Xray process {pid} not found.")
+    except PermissionError:
+        raise RuntimeError(f"No permission to signal xray process {pid}.")
+
+
 def is_running() -> bool:
     """
     Check if xray-core is currently running.
