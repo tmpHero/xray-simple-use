@@ -292,6 +292,145 @@ def ensure_server_name(config: dict) -> str:
     return address
 
 
+def _build_outbound(cfg: VLESSConfig, address: str, tag: str) -> dict:
+    """
+    Build a single VLESS outbound entry with a specific address and tag.
+
+    Args:
+        cfg: Base VLESS configuration.
+        address: Server address for this outbound.
+        tag: Outbound tag name.
+
+    Returns:
+        Outbound dict for Xray config.
+    """
+    stream_settings = _build_stream_settings(cfg)
+    vnext_user = {"id": cfg.uuid, "encryption": cfg.encryption}
+    if cfg.flow:
+        vnext_user["flow"] = cfg.flow
+
+    return {
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": address,
+                "port": cfg.port,
+                "users": [vnext_user],
+            }]
+        },
+        "streamSettings": stream_settings,
+        "tag": tag,
+    }
+
+
+def _build_test_socks_inbound(port: int, outbound_tag: str) -> dict:
+    """Build a SOCKS5 inbound that routes to a specific outbound."""
+    return {
+        "tag": f"test-{outbound_tag}",
+        "port": port,
+        "listen": "127.0.0.1",
+        "protocol": "socks",
+        "settings": {"udp": True},
+    }
+
+
+def generate_test_config(
+    cfg: VLESSConfig,
+    ips: list[str],
+    active_ip: str = "",
+    socks_port: int = 10808,
+    http_port: int = 10809,
+    test_base_port: int = 11001,
+) -> dict:
+    """
+    Generate a multi-outbound Xray config for concurrent candidate testing.
+
+    Structure:
+      inbounds:
+        socks:10808 → proxy (main)
+        socks:11001 → candidate-1-out (test port for IP 1)
+        socks:11002 → candidate-2-out
+        ...
+      outbounds:
+        proxy (active_ip)
+        candidate-1-out (ip1)
+        candidate-2-out (ip2)
+        ...
+        direct (freedom)
+
+    Args:
+        cfg: Base VLESS configuration (protocol params shared by all outbounds).
+        ips: Candidate IP addresses to create test outbounds for.
+        active_ip: Current active IP for the main proxy outbound.
+        socks_port: Main SOCKS5 port.
+        http_port: Main HTTP proxy port.
+        test_base_port: Starting port for per-candidate test SOCKS inbounds.
+
+    Returns:
+        Xray config dict.
+    """
+    if not active_ip:
+        active_ip = ips[0] if ips else cfg.address
+
+    inbounds = [
+        {
+            "tag": "socks",
+            "port": socks_port,
+            "listen": "127.0.0.1",
+            "protocol": "socks",
+            "settings": {"udp": True},
+        },
+        {
+            "tag": "http",
+            "port": http_port,
+            "listen": "127.0.0.1",
+            "protocol": "http",
+            "settings": {},
+        },
+    ]
+
+    outbounds = [
+        _build_outbound(cfg, active_ip, "proxy"),
+    ]
+
+    routing_rules = [
+        {
+            "type": "field",
+            "inboundTag": ["socks", "http"],
+            "outboundTag": "proxy",
+        },
+    ]
+
+    for i, ip in enumerate(ips):
+        tag = f"candidate-{i + 1}-out"
+        test_tag = f"test-candidate-{i + 1}"
+        test_port = test_base_port + i
+
+        inbounds.append(_build_test_socks_inbound(test_port, tag))
+        outbounds.append(_build_outbound(cfg, ip, tag))
+        routing_rules.append({
+            "type": "field",
+            "inboundTag": [f"test-{tag}"],
+            "outboundTag": tag,
+        })
+
+    outbounds.append({
+        "protocol": "freedom",
+        "tag": "direct",
+        "settings": {},
+    })
+
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": routing_rules,
+        },
+    }
+
+
 def save_config(config: dict, filepath: str) -> None:
     """Save config dict as JSON file.
 

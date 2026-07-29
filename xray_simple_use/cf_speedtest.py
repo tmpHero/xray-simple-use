@@ -102,6 +102,7 @@ def run_speedtest(
     max_delay: int = 300,
     test_port: int = 443,
     test_url: str = "",
+    skip_download: bool = False,
 ) -> list[IPResult]:
     """
     Run CloudflareSpeedTest and return parsed results.
@@ -112,6 +113,7 @@ def run_speedtest(
         -tl max_delay: upper limit for acceptable average delay (ms)
         -tp test_port: port to test (default CFST: 443)
         -url test_url: URL for download speed test
+        -dd skip download speed test (faster, for coarse filtering)
         -o  output CSV path
 
     Args:
@@ -120,6 +122,7 @@ def run_speedtest(
         max_delay: Max acceptable delay in ms (-tl).
         test_port: Port to test (-tp).
         test_url: URL for download speed test (-url).
+        skip_download: Skip download speed test (-dd) for faster coarse scan.
 
     Returns:
         List of IPResult filtered and sorted by latency.
@@ -144,12 +147,15 @@ def run_speedtest(
         "-tp", str(test_port),
         "-o", str(_RESULT_CSV),
     ]
+    if skip_download:
+        cmd.append("-dd")
     if test_url:
         cmd.extend(["-url", test_url])
 
     print(
         f"Running CloudflareSpeedTest "
-        f"(concurrency={concurrency}, attempts={attempts}, port={test_port}) ..."
+        f"(concurrency={concurrency}, attempts={attempts}, port={test_port}"
+        f"{', skip_download' if skip_download else ''}) ..."
     )
 
     start_time = time.monotonic()
@@ -302,3 +308,47 @@ def get_top_ips(results: list[IPResult], n: int = 5) -> list[str]:
         List of IP address strings.
     """
     return [r.ip for r in results[:n]]
+
+
+def check_proxy_interference(results: list[IPResult]) -> tuple[bool, str]:
+    """
+    Check if CFST results look like traffic went through a proxy.
+
+    Signs of proxy interference:
+        - All latencies are suspiciously low (< 1ms)
+        - All latencies are too close together (std dev < 0.5ms)
+        - No valid results (empty list)
+
+    Args:
+        results: List of IPResult from CFST.
+
+    Returns:
+        Tuple of (is_clean: bool, message: str).
+    """
+    if not results:
+        return False, "No valid results — CSV may be empty or corrupted."
+
+    latencies = [r.latency for r in results if r.latency > 0]
+    if not latencies:
+        return False, "All latencies are zero — CFST traffic may go through proxy."
+
+    # All results under 1ms is physically impossible without proxy
+    if all(l < 1.0 for l in latencies):
+        return False, (
+            "All latencies < 1ms — CFST traffic likely went through proxy. "
+            "Ensure CFST runs directly, not through TUN/transparent proxy."
+        )
+
+    # Very low variance with many samples suggests all hitting same proxy
+    if len(latencies) >= 3:
+        mean = sum(latencies) / len(latencies)
+        variance = sum((l - mean) ** 2 for l in latencies) / len(latencies)
+        stddev = variance ** 0.5
+        if stddev < 0.5 and mean < 5.0:
+            return False, (
+                f"Abnormally tight latency distribution (mean={mean:.1f}ms, "
+                f"stddev={stddev:.2f}ms) — possible proxy interference."
+            )
+
+    return True, "OK"
+
