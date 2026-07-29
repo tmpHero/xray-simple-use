@@ -13,6 +13,7 @@ from xray_simple_use.vless import (
     generate_client_config,
     save_config,
     load_config,
+    ensure_server_name,
 )
 from xray_simple_use.xray import (
     download_xray,
@@ -26,14 +27,17 @@ from xray_simple_use.xray import (
 from xray_simple_use.cf_speedtest import (
     download_cfst,
     run_speedtest,
+    filter_valid_ips,
     get_best_ip,
     get_top_ips,
     IPResult,
+    _get_cfst_binary,
 )
 from xray_simple_use.speedtest import (
     test_connectivity,
     test_latency,
     test_download_speed,
+    quick_verify,
     check_curl_available,
 )
 
@@ -67,10 +71,11 @@ def main():
 
     # optimize
     p_opt = subparsers.add_parser("optimize", help="Run CloudflareSpeedTest and update config")
-    p_opt.add_argument("--count", type=int, default=200, help="Number of IPs to test (default: 200)")
-    p_opt.add_argument("--threads", type=int, default=4, help="Concurrent threads (default: 4)")
+    p_opt.add_argument("--concurrency", type=int, default=4, help="CFST concurrency threads -n (default: 4)")
+    p_opt.add_argument("--attempts", type=int, default=4, help="CFST tests per IP -t (default: 4)")
+    p_opt.add_argument("--threshold", type=float, default=10.0, help="Min latency improvement in ms to switch (default: 10)")
     p_opt.add_argument("--restart", action="store_true", help="Restart xray after updating address")
-    p_opt.add_argument("--verify", action="store_true", help="Verify proxy connectivity after restart (requires curl)")
+    p_opt.add_argument("--verify", action="store_true", help="Verify proxy connectivity after restart (requires --restart)")
     p_opt.add_argument("--url", type=str, default="", help="vless:// link (if no existing config)")
 
     # speedtest
@@ -160,7 +165,11 @@ def cmd_status(args):
 
 
 def cmd_optimize(args):
-    """Run CloudflareSpeedTest, pick best IP by combined score, optionally verify via proxy."""
+    """Run CloudflareSpeedTest, pick best IP, update config with rollback support."""
+    if args.verify and not args.restart:
+        print("Error: --verify requires --restart (need running proxy to test against)")
+        sys.exit(1)
+
     if args.url:
         cfg = parse_vless_link(args.url)
         config = generate_client_config(cfg)
@@ -172,57 +181,90 @@ def cmd_optimize(args):
         print("Run 'start <vless_url>' first, or use 'optimize --url <vless_url>'")
         sys.exit(1)
 
-    from xray_simple_use.cf_speedtest import _get_cfst_binary
     if not _get_cfst_binary().exists():
         print("CloudflareSpeedTest not found, downloading ...")
         download_cfst()
 
-    # Step 1: run CloudflareSpeedTest
-    results = run_speedtest(count=args.count, threads=args.threads)
-    top5 = results[:5]
+    # Load current config
+    config = load_config(str(_CONFIG_FILE))
+    old_address = config["outbounds"][0]["settings"]["vnext"][0]["address"]
+    vless_port = config["outbounds"][0]["settings"]["vnext"][0]["port"]
 
-    print(f"\n=== CFST Top 5 (sorted by latency) ===")
+    # Step 1: ensure serverName is set before we replace address with IP
+    ensure_server_name(config)
+    save_config(config, str(_CONFIG_FILE))
+
+    # Step 2: run CloudflareSpeedTest on the actual VLESS port
+    results = run_speedtest(
+        concurrency=args.concurrency,
+        attempts=args.attempts,
+        test_port=vless_port,
+    )
+    valid = filter_valid_ips(results)
+    top5 = valid[:5]
+
+    print(f"\n=== CFST Top 5 (filtered: no loss, speed>0) ===")
     for i, r in enumerate(top5):
         print(f"  {i+1}. {r.ip}  latency={r.latency:.1f}ms  speed={r.download_speed:.2f}MB/s")
 
-    # Step 2: pick best by CFST ranking (already latency-sorted in parse)
-    best_ip = get_best_ip(results)
+    best_ip = get_best_ip(valid)
     if not best_ip:
-        print("No valid IP found.")
+        print("No valid IP found after filtering.")
         sys.exit(1)
 
-    print(f"\nBest IP: {best_ip} (latency={results[0].latency:.1f}ms, speed={results[0].download_speed:.2f}MB/s)")
+    # Step 3: threshold check — only switch if improvement is significant
+    if old_address == best_ip:
+        print(f"\nBest IP is same as current ({best_ip}), no change needed.")
+        return
 
-    # Step 3: update config
-    config = load_config(str(_CONFIG_FILE))
-    old_address = config["outbounds"][0]["settings"]["vnext"][0]["address"]
+    improvement = top5[0].latency if top5 else float("inf")
+    print(f"\nBest IP: {best_ip} (CFST latency={improvement:.1f}ms, speed={top5[0].download_speed:.2f}MB/s)")
+
+    # Step 4: backup old config, then update
+    backup_config = json.loads(json.dumps(config))  # deep copy
     config["outbounds"][0]["settings"]["vnext"][0]["address"] = best_ip
     save_config(config, str(_CONFIG_FILE))
     print(f"Address updated: {old_address} -> {best_ip}")
 
-    # Step 4: restart and verify
+    # Step 5: restart and optionally verify
     if args.restart:
-        if is_running():
+        was_running = is_running()
+        if was_running:
             stop_xray()
         start_xray(config)
         time.sleep(1)
         print("Xray restarted.")
 
     if args.verify:
-        _do_verify()
+        success, latency, err = _do_verify_with_result()
+        if success:
+            print(f"Verify OK: proxy latency={latency}ms")
+        else:
+            print(f"Verify FAILED: {err}")
+            print("Rolling back to previous config ...")
+            save_config(backup_config, str(_CONFIG_FILE))
+            if was_running:
+                if is_running():
+                    stop_xray()
+                start_xray(backup_config)
+            print("Rollback complete, previous config restored.")
+            sys.exit(1)
+
+
+def _do_verify_with_result() -> tuple[bool, float, str]:
+    """Quick connectivity check through proxy, return (success, latency, error)."""
+    if not check_curl_available():
+        return False, 0.0, "curl not available"
+    return quick_verify()
 
 
 def _do_verify():
-    """Quick connectivity check through the proxy."""
-    if not check_curl_available():
-        print("curl not available, skipping verification.")
-        return
-
-    result = test_connectivity()
-    if result.connected:
-        print(f"Proxy OK: latency={result.latency_ms}ms")
+    """Quick connectivity check through the proxy (print only)."""
+    success, latency, err = _do_verify_with_result()
+    if success:
+        print(f"Proxy OK: latency={latency}ms")
     else:
-        print(f"Proxy FAILED: {result.error}")
+        print(f"Proxy FAILED: {err}")
 
 
 def cmd_speedtest(args):

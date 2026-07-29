@@ -250,6 +250,48 @@ def _build_stream_settings(cfg: VLESSConfig) -> dict:
     return settings
 
 
+def ensure_server_name(config: dict) -> str:
+    """
+    Ensure TLS/serverName is set if address is a domain.
+
+    When optimize replaces a domain address with an IP, TLS/REALITY needs an
+    explicit serverName to pass SNI validation. If the current address is not
+    an IP and the stream security settings lack serverName, fill it in.
+
+    Args:
+        config: Xray config dict.
+
+    Returns:
+        The current address from the outbound config.
+    """
+    from ipaddress import ip_address
+
+    outbound = config["outbounds"][0]
+    stream = outbound["streamSettings"]
+    address = outbound["settings"]["vnext"][0]["address"]
+    security = stream.get("security", "")
+
+    # Only needed when address is a domain (not an IP)
+    try:
+        ip_address(address)
+        return address  # Already an IP, SNI can't be derived from it anyway
+    except ValueError:
+        pass  # It's a domain, need to ensure serverName
+
+    if security == "reality":
+        reality = stream.get("realitySettings", {})
+        if not reality.get("serverName"):
+            reality["serverName"] = address
+            stream["realitySettings"] = reality
+    elif security == "tls":
+        tls = stream.get("tlsSettings", {})
+        if not tls.get("serverName"):
+            tls["serverName"] = address
+            stream["tlsSettings"] = tls
+
+    return address
+
+
 def save_config(config: dict, filepath: str) -> None:
     """Save config dict as JSON file.
 

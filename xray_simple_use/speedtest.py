@@ -197,6 +197,40 @@ def test_download_speed(
         return ProxyTestResult(connected=False, error=str(e))
 
 
+def quick_verify(
+    socks_port: int = _DEFAULT_SOCKS_PORT,
+    attempts: int = 3,
+    timeout: int = 10,
+) -> tuple[bool, float, str]:
+    """
+    Verify proxy works: test connectivity multiple times, return median latency.
+
+    Args:
+        socks_port: Local SOCKS5 proxy port.
+        attempts: Number of connectivity test attempts.
+        timeout: Per-attempt timeout in seconds.
+
+    Returns:
+        Tuple of (success, median_latency_ms, error_message).
+    """
+    latencies: list[float] = []
+    last_error = ""
+
+    for _ in range(attempts):
+        result = test_connectivity(socks_port=socks_port, timeout=timeout)
+        if result.connected:
+            latencies.append(result.latency_ms)
+        else:
+            last_error = result.error
+
+    if not latencies:
+        return False, 0.0, last_error
+
+    latencies.sort()
+    median = latencies[len(latencies) // 2]
+    return True, median, ""
+
+
 def check_curl_available() -> bool:
     """Check if curl is available on the system."""
     try:
