@@ -47,9 +47,10 @@ def test_connectivity(
     """
     cmd = [
         _CURL_BIN,
-        "--socks5", f"127.0.0.1:{socks_port}",
+        "--socks5-hostname", f"127.0.0.1:{socks_port}",
+        "--fail",
         "-s", "-o", "/dev/null",
-        "-w", "%{time_total}",
+        "-w", "%{http_code}\n%{time_total}",
         "--max-time", str(timeout),
         test_url,
     ]
@@ -60,10 +61,24 @@ def test_connectivity(
         elapsed = time.monotonic() - start
 
         if proc.returncode == 0:
-            try:
-                latency = float(proc.stdout.strip()) * 1000  # Convert seconds to ms
-            except ValueError:
-                latency = elapsed * 1000
+            lines = proc.stdout.strip().split("\n")
+            if len(lines) >= 2:
+                http_code = lines[0].strip()
+                time_val = lines[1].strip()
+                if http_code not in ("204", "200", "301", "302"):
+                    return ProxyTestResult(
+                        connected=False,
+                        error=f"Unexpected HTTP status: {http_code}",
+                    )
+                try:
+                    latency = float(time_val) * 1000
+                except ValueError:
+                    latency = elapsed * 1000
+            else:
+                try:
+                    latency = float(proc.stdout.strip()) * 1000
+                except ValueError:
+                    latency = elapsed * 1000
 
             return ProxyTestResult(
                 connected=True,
@@ -107,7 +122,7 @@ def test_latency(
     for url in urls:
         cmd = [
             _CURL_BIN,
-            "--socks5", f"127.0.0.1:{socks_port}",
+            "--socks5-hostname", f"127.0.0.1:{socks_port}",
             "-s", "-o", "/dev/null",
             "-w", "%{time_total}",
             "--max-time", str(timeout),
@@ -150,7 +165,7 @@ def test_download_speed(
 
     cmd = [
         _CURL_BIN,
-        "--socks5", f"127.0.0.1:{socks_port}",
+        "--socks5-hostname", f"127.0.0.1:{socks_port}",
         "-s", "-o", "/dev/null",
         "-w", "%{time_total}\n%{size_download}",
         "--max-time", str(timeout),

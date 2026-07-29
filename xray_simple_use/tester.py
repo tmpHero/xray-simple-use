@@ -4,6 +4,7 @@ Concurrent real-link testing of candidate IPs through Xray VLESS tunnel.
 
 import concurrent.futures
 import json
+import math
 import statistics
 import subprocess
 import tempfile
@@ -93,11 +94,14 @@ def _compute_stats(latencies: list[float]) -> tuple[float, float, float]:
     """
     Compute median, P95, and jitter (stddev) from latency samples.
 
+    Uses nearest-rank method for P95.
+    When samples < 10, P95 is less meaningful — returns max_latency instead.
+
     Args:
         latencies: List of latency values in ms.
 
     Returns:
-        Tuple of (median, p95, jitter) in ms.
+        Tuple of (median, p95_or_max, jitter) in ms.
     """
     if not latencies:
         return 0.0, 0.0, 0.0
@@ -112,8 +116,8 @@ def _compute_stats(latencies: list[float]) -> tuple[float, float, float]:
     else:
         median = sorted_lat[mid]
 
-    # P95
-    p95_idx = max(0, int(n * 0.95) - 1)
+    # P95 (nearest-rank): ceil(0.95 * n) - 1
+    p95_idx = math.ceil(0.95 * n) - 1
     p95 = sorted_lat[p95_idx]
 
     # Jitter (stddev)
@@ -182,13 +186,24 @@ def test_candidates(
     tmp.close()
 
     # Start test xray instance
-    print(f"[TESTER] Starting xray with {len(ips)} candidate outbounds ...")
+    print(f"[TESTER] Starting test xray with {len(ips)} candidate outbounds ...")
     proc = subprocess.Popen(
         [str(xray_bin), "run", "-c", tmp.name],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    time.sleep(1.5)  # Allow xray to initialize
+
+    # Verify the test xray started successfully
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        Path(tmp.name).unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Test xray exited immediately (code={proc.returncode}). "
+            f"Check config or port conflicts."
+        )
+
+    # Give it a bit more time for TLS/REALITY handshake setup
+    time.sleep(1.0)
 
     # Test all candidates concurrently
     results: list[TestResult] = []

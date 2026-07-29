@@ -3,6 +3,8 @@ IP priority queue persistence: load, save, failover, circuit breaker.
 """
 
 import json
+import os
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -11,6 +13,12 @@ from typing import Optional
 
 _PROJECT_ROOT = Path(__file__).parent.parent
 _QUEUE_FILE = _PROJECT_ROOT / "queue.json"
+
+# Minimum success rate for a candidate to enter the queue
+_MIN_SUCCESS_RATE = 2 / 3
+_MIN_SUCCESS_COUNT = 2
+
+_write_lock = threading.Lock()
 
 
 @dataclass
@@ -34,7 +42,7 @@ class Candidate:
 @dataclass
 class IPQueue:
     """Persistent IP priority queue."""
-    generated_at: str = ""  # ISO 8601
+    generated_at: str = ""
     active_ip: str = ""
     candidates: list[Candidate] = field(default_factory=list)
 
@@ -81,7 +89,7 @@ def load_queue() -> Optional[IPQueue]:
 
 def save_queue(queue: IPQueue) -> None:
     """
-    Persist IPQueue to queue.json.
+    Persist IPQueue to queue.json atomically (tmp → flush → fsync → rename).
 
     Args:
         queue: IPQueue to save.
@@ -102,7 +110,13 @@ def save_queue(queue: IPQueue) -> None:
             for c in queue.candidates
         ],
     }
-    _QUEUE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp_path = str(_QUEUE_FILE) + ".tmp"
+    with _write_lock:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, str(_QUEUE_FILE))
 
 
 def get_next_available(queue: IPQueue, failed_ip: str) -> Optional[str]:
@@ -187,9 +201,32 @@ def clear_cooldown(queue: IPQueue, ip: str) -> None:
             return
 
 
+def _is_qualified(result: dict) -> bool:
+    """
+    Check if a test result qualifies for entering the queue.
+
+    Requires: total >= 3, success >= 2, success_rate >= 2/3, latency > 0.
+
+    Args:
+        result: Test result dict with success_count, failure_count, median_latency.
+
+    Returns:
+        True if the result meets minimum quality threshold.
+    """
+    total = result["success_count"] + result["failure_count"]
+    if total < 3 or result["success_count"] < _MIN_SUCCESS_COUNT:
+        return False
+    if total > 0 and result["success_count"] / total < _MIN_SUCCESS_RATE:
+        return False
+    if result.get("median_latency", 0.0) <= 0:
+        return False
+    return True
+
+
 def sort_candidates(results: list[dict]) -> list[Candidate]:
     """
     Sort test results into ranked Candidate list.
+    Only includes qualified results (success_rate >= 2/3, success >= 2).
 
     Ranking priority:
         1. success_rate (higher is better)
@@ -202,10 +239,12 @@ def sort_candidates(results: list[dict]) -> list[Candidate]:
                  median_latency, p95_latency, jitter.
 
     Returns:
-        Sorted list of Candidate objects.
+        Sorted list of Candidate objects (qualified only).
     """
     candidates = []
     for r in results:
+        if not _is_qualified(r):
+            continue
         total = r["success_count"] + r["failure_count"]
         rate = r["success_count"] / total if total > 0 else 0.0
         candidates.append(Candidate(
@@ -229,11 +268,15 @@ def build_queue(results: list[dict]) -> IPQueue:
     """
     Build a new IPQueue from test results.
 
+    Only includes candidates meeting minimum quality threshold.
+    Returns empty IPQueue (no candidates) if none qualify — caller
+    must retain the old queue in that case.
+
     Args:
         results: List of test result dicts.
 
     Returns:
-        IPQueue with sorted candidates and active_ip set to best.
+        IPQueue with sorted qualified candidates, or empty if none qualify.
     """
     candidates = sort_candidates(results)
     active_ip = candidates[0].ip if candidates else ""
