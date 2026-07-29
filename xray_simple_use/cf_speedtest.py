@@ -4,12 +4,13 @@ Run CloudflareSpeedTest to find the best Cloudflare IP for the proxy.
 
 import csv
 import os
-import re
 import shutil
 import subprocess
-import sys
+import tarfile
+import time
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from ipaddress import ip_address, IPv4Address, IPv6Address
 from pathlib import Path
 from typing import Optional
 
@@ -17,12 +18,12 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 _THIRD_PARTY = _PROJECT_ROOT / "third_party"
 _CFST_DIR = _THIRD_PARTY / "cfst"
 _RESULT_CSV = _PROJECT_ROOT / "cfst_result.csv"
-_DEFAULT_THREADS = 4
-_DEFAULT_COUNT = 200
+_DEFAULT_CONCURRENCY = 4
+_DEFAULT_ATTEMPTS = 4
 
 CFST_DOWNLOAD_URL = (
     "https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/"
-    "CloudflareST_linux_amd64.tar.gz"
+    "cfst_linux_amd64.tar.gz"
 )
 
 
@@ -30,8 +31,7 @@ CFST_DOWNLOAD_URL = (
 class IPResult:
     """Single CloudflareSpeedTest result."""
     ip: str
-    port: int = 443
-    latency: float = 0.0
+    latency: float = 0.0       # ms
     download_speed: float = 0.0  # MB/s
     loss_rate: float = 0.0
     sent: int = 0
@@ -45,10 +45,9 @@ class IPResult:
 
 def _get_cfst_binary() -> Path:
     """Get path to CloudflareSpeedTest binary."""
-    sysname = os.name
-    if sysname == "nt":
-        return _CFST_DIR / "CloudflareST.exe"
-    return _CFST_DIR / "CloudflareST"
+    if os.name == "nt":
+        return _CFST_DIR / "cfst.exe"
+    return _CFST_DIR / "cfst"
 
 
 def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
@@ -56,7 +55,7 @@ def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
     Download and extract CloudflareSpeedTest binary.
 
     Args:
-        url: Download URL for the release tar.gz.
+        url: Download URL for the release tarball.
 
     Returns:
         Path to the extracted binary.
@@ -78,7 +77,6 @@ def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
         raise RuntimeError(f"Failed to download CloudflareSpeedTest: {e}") from e
 
     print("Extracting ...")
-    import tarfile
     try:
         with tarfile.open(tmp_path, "r:gz") as tf:
             tf.extractall(_CFST_DIR)
@@ -90,7 +88,7 @@ def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
     cfst_bin = _get_cfst_binary()
     if not cfst_bin.exists():
         raise RuntimeError(
-            f"CloudflareSpeedTest binary not found after extraction: {cfst_bin}"
+            f"cfst binary not found after extraction: {cfst_bin}"
         )
 
     cfst_bin.chmod(0o755)
@@ -99,22 +97,32 @@ def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
 
 
 def run_speedtest(
-    count: int = _DEFAULT_COUNT,
-    threads: int = _DEFAULT_THREADS,
-    test_url: str = "",
+    concurrency: int = _DEFAULT_CONCURRENCY,
+    attempts: int = _DEFAULT_ATTEMPTS,
     max_delay: int = 300,
+    test_port: int = 443,
+    test_url: str = "",
 ) -> list[IPResult]:
     """
     Run CloudflareSpeedTest and return parsed results.
 
+    CFST flags:
+        -n  concurrency: number of concurrent latency test threads
+        -t  attempts: number of latency tests per IP
+        -tl max_delay: upper limit for acceptable average delay (ms)
+        -tp test_port: port to test (default CFST: 443)
+        -url test_url: URL for download speed test
+        -o  output CSV path
+
     Args:
-        count: Number of IPs to test.
-        threads: Number of concurrent threads.
-        test_url: URL for download speed test (default: CFST built-in).
-        max_delay: Max acceptable average delay in ms.
+        concurrency: Concurrent threads (-n).
+        attempts: Tests per IP (-t).
+        max_delay: Max acceptable delay in ms (-tl).
+        test_port: Port to test (-tp).
+        test_url: URL for download speed test (-url).
 
     Returns:
-        List of IPResult sorted by latency (lowest first).
+        List of IPResult filtered and sorted by latency.
 
     Raises:
         RuntimeError: If binary not found or execution fails.
@@ -122,20 +130,29 @@ def run_speedtest(
     cfst_bin = _get_cfst_binary()
     if not cfst_bin.exists():
         raise RuntimeError(
-            f"CloudflareSpeedTest binary not found. Run download first."
+            "CloudflareSpeedTest binary not found. Run setup or download first."
         )
+
+    # Remove stale result CSV so we don't reuse old data
+    _RESULT_CSV.unlink(missing_ok=True)
 
     cmd = [
         str(cfst_bin),
-        "-n", str(count),
-        "-t", str(threads),
+        "-n", str(concurrency),
+        "-t", str(attempts),
         "-tl", str(max_delay),
+        "-tp", str(test_port),
         "-o", str(_RESULT_CSV),
     ]
     if test_url:
         cmd.extend(["-url", test_url])
 
-    print(f"Running CloudflareSpeedTest (count={count}, threads={threads}) ...")
+    print(
+        f"Running CloudflareSpeedTest "
+        f"(concurrency={concurrency}, attempts={attempts}, port={test_port}) ..."
+    )
+
+    start_time = time.monotonic()
     result = subprocess.run(
         cmd,
         cwd=str(_CFST_DIR),
@@ -143,8 +160,13 @@ def run_speedtest(
         text=True,
     )
 
-    output = result.stdout
-    print(output)
+    print(result.stdout)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"CloudflareSpeedTest exited with code {result.returncode}. "
+            f"stderr: {result.stderr}"
+        )
 
     if not _RESULT_CSV.exists():
         raise RuntimeError(
@@ -154,7 +176,7 @@ def run_speedtest(
 
     results = _parse_result_csv(str(_RESULT_CSV))
     if not results:
-        raise RuntimeError("CloudflareSpeedTest returned no results.")
+        raise RuntimeError("CloudflareSpeedTest returned no valid results.")
 
     return results
 
@@ -162,6 +184,11 @@ def run_speedtest(
 def _parse_result_csv(csv_path: str) -> list[IPResult]:
     """
     Parse CloudflareSpeedTest result CSV into IPResult list.
+
+    CSV format (current CFST version, no port column):
+        IP 地址,已发送,已接收,丢包率,平均延迟,下载速度 (MB/s),地区
+
+    Uses DictReader when header is present; falls back to positional parsing.
 
     Args:
         csv_path: Path to the result CSV file.
@@ -173,43 +200,87 @@ def _parse_result_csv(csv_path: str) -> list[IPResult]:
 
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
-        for row in reader:
-            if not row or not row[0].strip():
-                continue
-            ip_val = row[0].strip()
-            if not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip_val):
-                continue
+        rows = list(reader)
 
-            try:
-                port = int(row[1]) if len(row) > 1 and row[1].strip() else 443
-                sent = int(row[2]) if len(row) > 2 and row[2].strip() else 0
-                received = int(row[3]) if len(row) > 3 and row[3].strip() else 0
-                loss = float(row[4]) if len(row) > 4 and row[4].strip() else 0.0
-                latency = float(row[5]) if len(row) > 5 and row[5].strip() else 0.0
-                speed = float(row[6]) if len(row) > 6 and row[6].strip() else 0.0
+    if not rows:
+        return results
 
-                results.append(IPResult(
-                    ip=ip_val,
-                    port=port,
-                    latency=latency,
-                    download_speed=speed,
-                    loss_rate=loss,
-                    sent=sent,
-                    received=received,
-                ))
-            except (ValueError, IndexError):
-                continue
+    # Detect header row (first cell contains non-IP text like "IP")
+    header_row = rows[0]
+    data_start = 0
+    if header_row:
+        first_cell = header_row[0].strip()
+        try:
+            ip_address(first_cell)
+            # Looks like an IP, no header
+            data_start = 0
+        except ValueError:
+            # Has header row, skip it
+            data_start = 1
+
+    for row in rows[data_start:]:
+        if not row or not row[0].strip():
+            continue
+
+        ip_val = row[0].strip()
+
+        # Validate IP address (IPv4 or IPv6)
+        try:
+            ip_address(ip_val)
+        except ValueError:
+            continue
+
+        try:
+            # Current CFST CSV: IP, sent, received, loss%, latency, speed, region
+            sent = int(row[1]) if len(row) > 1 and row[1].strip() else 0
+            received = int(row[2]) if len(row) > 2 and row[2].strip() else 0
+            loss = float(row[3]) if len(row) > 3 and row[3].strip() else 0.0
+            latency = float(row[4]) if len(row) > 4 and row[4].strip() else 0.0
+            speed = float(row[5]) if len(row) > 5 and row[5].strip() else 0.0
+        except (ValueError, IndexError):
+            continue
+
+        results.append(IPResult(
+            ip=ip_val,
+            latency=latency,
+            download_speed=speed,
+            loss_rate=loss,
+            sent=sent,
+            received=received,
+        ))
 
     results.sort(key=lambda r: r.latency)
     return results
 
 
-def get_best_ip(results: list[IPResult]) -> Optional[str]:
+def filter_valid_ips(results: list[IPResult]) -> list[IPResult]:
     """
-    Get the IP with lowest latency from results.
+    Filter results: must have no packet loss and non-zero download speed.
 
     Args:
-        results: List of IPResult from run_speedtest.
+        results: Raw IPResult list from parse.
+
+    Returns:
+        Filtered list sorted by latency.
+    """
+    valid = [
+        r for r in results
+        if r.received > 0
+        and r.loss_rate == 0.0
+        and r.download_speed > 0.0
+    ]
+    if not valid:
+        # Fallback: at least require received packets
+        valid = [r for r in results if r.received > 0]
+    return valid
+
+
+def get_best_ip(results: list[IPResult]) -> Optional[str]:
+    """
+    Get the best IP from filtered results (lowest latency first).
+
+    Args:
+        results: List of IPResult (should be filtered via filter_valid_ips).
 
     Returns:
         Best IP address string, or None if empty.
@@ -224,7 +295,7 @@ def get_top_ips(results: list[IPResult], n: int = 5) -> list[str]:
     Get top N IPs sorted by latency.
 
     Args:
-        results: List of IPResult from run_speedtest.
+        results: List of IPResult.
         n: Number of top IPs to return.
 
     Returns:
