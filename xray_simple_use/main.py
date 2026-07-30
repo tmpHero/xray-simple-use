@@ -269,7 +269,10 @@ def cmd_log(args):
     if not log_files:
         print("No log files found.")
         return
-    subprocess.run(["tail", "-f"] + [str(f) for f in log_files])
+    try:
+        subprocess.run(["tail", "-f"] + [str(f) for f in log_files])
+    except KeyboardInterrupt:
+        pass
 
 
 def cmd_optimize(args):
