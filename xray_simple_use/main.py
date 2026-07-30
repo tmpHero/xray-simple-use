@@ -4,9 +4,13 @@ CLI entry point for xray_simple_use — lightweight Xray deployment tool.
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).parent.parent
 
 from xray_simple_use.config import load_ini, Config
 from xray_simple_use.stability_test import StabilityTest
@@ -94,11 +98,15 @@ def main():
     )
 
     # run
-    p_run = subparsers.add_parser("run", help="Start daemon with health monitoring and failover")
+    p_run = subparsers.add_parser("run", help="Start daemon (runs in background by default)")
     p_run.add_argument("url", nargs="?", default="", help="vless:// share link URL (optional if --config is used)")
     p_run.add_argument("--config", type=str, default="", help="Path to config.ini (default: auto-detect)")
+    p_run.add_argument("-f", "--foreground", action="store_true", help="Run in foreground (don't daemonize)")
     p_run.add_argument("--socks-port", type=int, default=10808, help="SOCKS5 port (default: 10808)")
     p_run.add_argument("--http-port", type=int, default=10809, help="HTTP proxy port (default: 10809)")
+
+    # log
+    subparsers.add_parser("log", help="Tail daemon logs (follow mode)")
 
     # stability-test
     p_stab = subparsers.add_parser("stability-test", help="Run 24h stability test (daemon must be running)")
@@ -107,7 +115,7 @@ def main():
 
     # setup
     p_setup = subparsers.add_parser("setup", help="Download xray-core and CloudflareSpeedTest")
-    p_setup.add_argument("--mirror", type=str, default="", help="GitHub mirror prefix (e.g. https://gh-proxy.com/)")
+    p_setup.add_argument("--mirror", nargs="?", const="https://gh-proxy.com/", default="", help="Use GitHub mirror (default: https://gh-proxy.com/)")
 
     args = parser.parse_args()
 
@@ -124,6 +132,7 @@ def main():
         "speedtest": cmd_speedtest,
         "run": cmd_run,
         "stability-test": cmd_stability_test,
+        "log": cmd_log,
         "setup": cmd_setup,
     }
 
@@ -184,26 +193,58 @@ def cmd_status(args):
         print("Xray is not running.")
 
 
+_DAEMON_PID_FILE = _PROJECT_ROOT / "daemon.pid"
+
+
 def cmd_run(args):
-    """Start daemon with health monitoring and automatic failover."""
+    """Start daemon. Detaches to background unless -f/--foreground."""
+    if not args.foreground and sys.platform != "win32":
+        # Setup file logging before forking so child logs persist
+        import logging
+        log_file = _PROJECT_ROOT / "daemon.log"
+        file_handler = logging.FileHandler(str(log_file))
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+        ))
+        logging.getLogger().addHandler(file_handler)
+
+        pid = os.fork()
+        if pid != 0:
+            print(f"Daemon started (pid={pid}). Use 'log' to view output.")
+            _DAEMON_PID_FILE.write_text(str(pid))
+            return
+        # Child: detach from terminal
+        os.setsid()
+        sys.stdout = open(os.devnull, "w")
+        sys.stderr = open(os.devnull, "w")
+
     # Load config
     config_path = Path(args.config) if args.config else None
-    app_config = load_ini(config_path)
+    try:
+        app_config = load_ini(config_path)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
     vless_url = args.url or app_config.vless_url
     if not vless_url:
-        print("Error: No VLESS URL provided. Use --url or set [server] vless_url in config.ini")
+        print("Error: No VLESS URL provided.")
         sys.exit(1)
 
     cfg = parse_share_link(vless_url)
-    print("=== VLESS Config ===")
-    for key, val in cfg.to_dict_safe().items():
-        print(f"  {key}: {val}")
-
     daemon = Daemon(cfg, app_config)
     daemon._socks_port = args.socks_port
     daemon._http_port = args.http_port
     daemon.run()
+
+
+def cmd_log(args):
+    """Tail daemon logs."""
+    log_files = sorted(_PROJECT_ROOT.glob("*.log"))
+    if not log_files:
+        print("No log files found.")
+        return
+    subprocess.run(["tail", "-f"] + [str(f) for f in log_files])
 
 
 def cmd_optimize(args):
