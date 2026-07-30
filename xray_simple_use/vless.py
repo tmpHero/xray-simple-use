@@ -2,19 +2,42 @@
 Parse VLESS share link and generate Xray-core client JSON config.
 """
 
+import base64
 import os
+import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse, parse_qs, unquote
 from typing import Optional
 import json
 
 
+def parse_share_link(url: str) -> "VLESSConfig":
+    """
+    Auto-detect share link type (vless:// or vmess://) and parse it.
+
+    Args:
+        url: A vless:// or vmess:// share link.
+
+    Returns:
+        VLESSConfig with all parsed parameters.
+
+    Raises:
+        ValueError: If the link is not recognized.
+    """
+    if url.startswith("vless://"):
+        return parse_vless_link(url)
+    if url.startswith("vmess://"):
+        return parse_vmess_link(url)
+    raise ValueError("Unsupported share link type. Expected vless:// or vmess://")
+
+
 @dataclass
 class VLESSConfig:
-    """Parsed VLESS link parameters."""
+    """Parsed VLESS/VMESS share link parameters."""
     uuid: str
     address: str
     port: int
+    protocol: str = "vless"   # "vless" or "vmess"
     encryption: str = "none"
     security: str = "none"
     flow: str = ""
@@ -31,6 +54,7 @@ class VLESSConfig:
     remark: str = ""
     authority: str = ""
     origin_address: str = ""  # Original hostname from the link, preserved for SNI
+    alter_id: int = 0         # VMESS alterId
 
     def to_dict(self) -> dict:
         """Return a dict summary of non-empty fields."""
@@ -131,6 +155,95 @@ def parse_vless_link(url: str) -> VLESSConfig:
     )
 
 
+def parse_vmess_link(url: str) -> VLESSConfig:
+    """
+    Parse a vmess:// share link into a VLESSConfig.
+
+    Format: vmess://base64(json) where JSON contains:
+        v, ps, add, port, id, aid, net, type, host, path, tls, sni, fp
+
+    Args:
+        url: Full vmess:// URL string.
+
+    Returns:
+        VLESSConfig with protocol="vmess".
+
+    Raises:
+        ValueError: If the link is not valid.
+    """
+    if not url.startswith("vmess://"):
+        raise ValueError("Not a vmess:// link")
+
+    b64 = url[len("vmess://"):]
+    # Handle padding
+    padding = 4 - len(b64) % 4
+    if padding != 4:
+        b64 += "=" * padding
+
+    try:
+        raw = base64.b64decode(b64).decode("utf-8")
+        data = json.loads(raw)
+    except Exception as e:
+        raise ValueError(f"Invalid vmess:// link (bad base64 or JSON): {e}") from e
+
+    uuid = data.get("id", "")
+    address = data.get("add", "")
+    try:
+        port = int(data.get("port", "443"))
+    except (ValueError, TypeError):
+        port = 443
+    remark = data.get("ps", "")
+
+    if not uuid or not address:
+        raise ValueError("Missing id or add in vmess link")
+
+    network = data.get("net", "tcp")
+    security = data.get("tls", "")
+    # vmess "tls" field is either "tls" or "reality" or empty
+    if security in ("none", ""):
+        security = "none"
+
+    try:
+        alter_id = int(data.get("aid", 0))
+    except (ValueError, TypeError):
+        alter_id = 0
+
+    # Map encryption/security for Xray compatibility
+    enc = "none"  # vmess uses "security" for encryption in Xray
+    scy = data.get("scy", "auto")
+
+    return VLESSConfig(
+        protocol="vmess",
+        uuid=uuid,
+        address=address,
+        port=port,
+        encryption="auto" if scy == "auto" else scy,
+        security=security,
+        sni=data.get("sni", ""),
+        fp=data.get("fp", "chrome"),
+        network=network,
+        path=data.get("path", ""),
+        host=data.get("host", ""),
+        remark=remark,
+        origin_address=sni_or_address(data),
+        alter_id=alter_id,
+    )
+
+
+def sni_or_address(data: dict) -> str:
+    """Get origin address: SNI if domain, otherwise add field."""
+    sni = data.get("sni", "")
+    if sni:
+        return sni
+    add = data.get("add", "")
+    try:
+        from ipaddress import ip_address
+        ip_address(add)
+        return ""  # IP, no domain SNI
+    except ValueError:
+        return add
+
+
 def generate_client_config(cfg: VLESSConfig, socks_port: int = 10808, http_port: int = 10809) -> dict:
     """
     Generate an Xray-core client JSON config from a VLESSConfig.
@@ -212,12 +325,17 @@ def _build_outbound(cfg: VLESSConfig, address: str, tag: str) -> dict:
         Outbound dict for Xray config.
     """
     stream_settings = _build_stream_settings(cfg)
-    vnext_user = {"id": cfg.uuid, "encryption": cfg.encryption}
+    vnext_user: dict = {"id": cfg.uuid}
+    if cfg.protocol == "vless":
+        vnext_user["encryption"] = cfg.encryption
+    else:
+        vnext_user["security"] = cfg.encryption  # vmess uses "security"
+        vnext_user["alterId"] = cfg.alter_id
     if cfg.flow:
         vnext_user["flow"] = cfg.flow
 
     return {
-        "protocol": "vless",
+        "protocol": cfg.protocol,
         "settings": {
             "vnext": [{
                 "address": address,

@@ -14,7 +14,6 @@ from typing import Optional
 
 from xray_simple_use.vless import (
     VLESSConfig,
-    parse_vless_link,
     generate_client_config,
     save_config,
     load_config,

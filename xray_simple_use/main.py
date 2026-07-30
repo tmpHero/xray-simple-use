@@ -13,6 +13,7 @@ from xray_simple_use.stability_test import StabilityTest
 
 from xray_simple_use.vless import (
     parse_vless_link,
+    parse_share_link,
     generate_client_config,
     save_config,
     load_config,
@@ -137,7 +138,7 @@ def main():
 
 def cmd_parse(args):
     """Parse vless link and display config summary."""
-    cfg = parse_vless_link(args.url)
+    cfg = parse_share_link(args.url)
     print("=== VLESS Config ===")
     for key, val in cfg.to_dict_safe().items():
         print(f"  {key}: {val}")
@@ -149,7 +150,7 @@ def cmd_parse(args):
 
 def cmd_start(args):
     """Parse vless link, generate config, start xray."""
-    cfg = parse_vless_link(args.url)
+    cfg = parse_share_link(args.url)
     print("=== VLESS Config ===")
     for key, val in cfg.to_dict_safe().items():
         print(f"  {key}: {val}")
@@ -193,7 +194,7 @@ def cmd_run(args):
         print("Error: No VLESS URL provided. Use --url or set [server] vless_url in config.ini")
         sys.exit(1)
 
-    cfg = parse_vless_link(vless_url)
+    cfg = parse_share_link(vless_url)
     print("=== VLESS Config ===")
     for key, val in cfg.to_dict_safe().items():
         print(f"  {key}: {val}")
@@ -217,7 +218,7 @@ def cmd_optimize(args):
         sys.exit(1)
 
     if args.url:
-        cfg = parse_vless_link(args.url)
+        cfg = parse_share_link(args.url)
         config = generate_client_config(cfg)
         save_config(config, str(_CONFIG_FILE))
         print(f"Config generated from vless link: {_CONFIG_FILE}")
