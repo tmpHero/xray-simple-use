@@ -43,11 +43,16 @@ class IPResult:
         return self.latency
 
 
-def _get_cfst_binary() -> Path:
-    """Get path to CloudflareSpeedTest binary."""
+def _get_cfst_binary() -> Path | None:
+    """Find the CloudflareSpeedTest binary (may be 'cfst' or 'CloudflareST')."""
+    candidates = ["cfst", "CloudflareST"]
     if os.name == "nt":
-        return _CFST_DIR / "cfst.exe"
-    return _CFST_DIR / "cfst"
+        candidates = ["cfst.exe", "CloudflareST.exe"]
+    for name in candidates:
+        p = _CFST_DIR / name
+        if p.exists():
+            return p
+    return None
 
 
 def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
@@ -98,9 +103,12 @@ def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
         tmp_path.unlink(missing_ok=True)
 
     cfst_bin = _get_cfst_binary()
-    if not cfst_bin.exists():
+    if cfst_bin is None:
+        # List what was extracted for debugging
+        extracted = list(_CFST_DIR.iterdir()) if _CFST_DIR.exists() else []
         raise RuntimeError(
-            f"cfst binary not found after extraction: {cfst_bin}"
+            f"cfst binary not found after extraction. "
+            f"Extracted contents: {[p.name for p in extracted]}"
         )
 
     cfst_bin.chmod(0o755)
@@ -143,7 +151,7 @@ def run_speedtest(
         RuntimeError: If binary not found or execution fails.
     """
     cfst_bin = _get_cfst_binary()
-    if not cfst_bin.exists():
+    if cfst_bin is None:
         raise RuntimeError(
             "CloudflareSpeedTest binary not found. Run setup or download first."
         )

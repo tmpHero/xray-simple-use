@@ -93,7 +93,7 @@ class Daemon:
 
         if not _XRAY_DIR.exists():
             download_xray()
-        if not _get_cfst_binary().exists():
+        if _get_cfst_binary() is None:
             download_cfst()
 
         self._startup()

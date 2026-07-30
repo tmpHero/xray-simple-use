@@ -227,7 +227,7 @@ def cmd_optimize(args):
         print("Run 'start <vless_url>' first, or use 'optimize --url <vless_url>'")
         sys.exit(1)
 
-    if not _get_cfst_binary().exists():
+    if _get_cfst_binary() is None:
         print("CloudflareSpeedTest not found, downloading ...")
         download_cfst()
 
