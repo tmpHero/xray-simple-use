@@ -197,11 +197,15 @@ def run_speedtest(
         f"{', skip_download' if skip_download else ''}) ..."
     )
 
+    cfst_log = _PROJECT_ROOT / "cfst.log"
     start_time = time.monotonic()
-    result = subprocess.run(
-        cmd,
-        cwd=str(_CFST_DIR),
-    )
+    with open(cfst_log, "w") as log_f:
+        result = subprocess.run(
+            cmd,
+            cwd=str(_CFST_DIR),
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+        )
 
     if result.returncode != 0:
         raise RuntimeError(
