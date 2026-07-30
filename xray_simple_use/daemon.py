@@ -186,6 +186,8 @@ class Daemon:
         )
         if result.ok:
             log.debug(f"[HEALTH] OK ({result.total_time_ms:.0f}ms)")
+        elif self._scanning:
+            log.debug(f"[HEALTH] Timeout during scan: {result.error}")
         else:
             log.warning(f"[HEALTH] FAIL: {result.error}")
         return result.ok
