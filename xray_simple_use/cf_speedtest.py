@@ -55,6 +55,33 @@ def _get_cfst_binary() -> Path | None:
     return None
 
 
+_IP_FILE = _CFST_DIR / "ip.txt"
+
+
+def _fetch_ip_list() -> None:
+    """Download Cloudflare IP ranges for CFST (ip.txt)."""
+    _CFST_DIR.mkdir(parents=True, exist_ok=True)
+    ip_file = _CFST_DIR / "ip.txt"
+    if ip_file.exists():
+        return
+
+    print("Fetching Cloudflare IP ranges ...")
+    try:
+        result = subprocess.run(
+            ["curl", "-Lf", "-o", str(ip_file),
+             "https://www.cloudflare.com/ips-v4"],
+            capture_output=False,
+        )
+        if result.returncode == 0:
+            print(f"IP list saved to {ip_file}")
+        else:
+            ip_file.unlink(missing_ok=True)
+            print("Warning: Failed to fetch Cloudflare IP ranges.")
+    except Exception as e:
+        ip_file.unlink(missing_ok=True)
+        print(f"Warning: Failed to fetch Cloudflare IP ranges: {e}")
+
+
 def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
     """
     Download and extract CloudflareSpeedTest binary.
@@ -113,6 +140,10 @@ def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
 
     cfst_bin.chmod(0o755)
     print(f"CloudflareSpeedTest installed to {_CFST_DIR}")
+
+    # Pre-fetch Cloudflare IP ranges
+    _fetch_ip_list()
+
     return cfst_bin
 
 
@@ -167,6 +198,10 @@ def run_speedtest(
         "-tp", str(test_port),
         "-o", str(_RESULT_CSV),
     ]
+
+    # Use local ip.txt if available
+    if _IP_FILE.exists():
+        cmd.extend(["-f", str(_IP_FILE)])
     if skip_download:
         cmd.append("-dd")
     if test_url:
