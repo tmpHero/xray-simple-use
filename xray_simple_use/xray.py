@@ -193,9 +193,15 @@ def stop_xray() -> None:
     print(f"Xray did not exit after {_STOP_TIMEOUT}s, sending SIGKILL.")
     try:
         os.kill(pid, signal.SIGKILL)
-        time.sleep(0.5)
+    except PermissionError:
+        _PID_FILE.unlink(missing_ok=True)
+        print(f"Warning: cannot signal pid {pid} (WSL limitation). PID file removed.")
+        return
+    time.sleep(0.5)
+    try:
         os.kill(pid, 0)
-        raise RuntimeError(f"Xray process {pid} could not be killed.")
+        _PID_FILE.unlink(missing_ok=True)
+        print(f"Warning: pid {pid} still alive (WSL limitation). PID file removed.")
     except ProcessLookupError:
         _PID_FILE.unlink(missing_ok=True)
         print("Xray killed.")
