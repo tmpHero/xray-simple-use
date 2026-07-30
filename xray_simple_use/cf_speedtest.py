@@ -55,31 +55,16 @@ def _get_cfst_binary() -> Path | None:
     return None
 
 
-_IP_FILE = _CFST_DIR / "ip.txt"
+_IP_FILE: Path | None = None  # Resolved lazily
 
 
-def _fetch_ip_list() -> None:
-    """Download Cloudflare IP ranges for CFST (ip.txt)."""
-    _CFST_DIR.mkdir(parents=True, exist_ok=True)
-    ip_file = _CFST_DIR / "ip.txt"
-    if ip_file.exists():
-        return
-
-    print("Fetching Cloudflare IP ranges ...")
-    try:
-        result = subprocess.run(
-            ["curl", "-Lf", "-o", str(ip_file),
-             "https://www.cloudflare.com/ips-v4"],
-            capture_output=False,
-        )
-        if result.returncode == 0:
-            print(f"IP list saved to {ip_file}")
-        else:
-            ip_file.unlink(missing_ok=True)
-            print("Warning: Failed to fetch Cloudflare IP ranges.")
-    except Exception as e:
-        ip_file.unlink(missing_ok=True)
-        print(f"Warning: Failed to fetch Cloudflare IP ranges: {e}")
+def _find_ip_file() -> Path | None:
+    """Find ip.txt bundled with CFST (may be in a subdirectory)."""
+    for root, _dirs, files in os.walk(_CFST_DIR):
+        for f in files:
+            if f == "ip.txt":
+                return Path(root) / f
+    return None
 
 
 def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
@@ -140,10 +125,6 @@ def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
 
     cfst_bin.chmod(0o755)
     print(f"CloudflareSpeedTest installed to {_CFST_DIR}")
-
-    # Pre-fetch Cloudflare IP ranges
-    _fetch_ip_list()
-
     return cfst_bin
 
 
@@ -199,9 +180,10 @@ def run_speedtest(
         "-o", str(_RESULT_CSV),
     ]
 
-    # Use local ip.txt if available
-    if _IP_FILE.exists():
-        cmd.extend(["-f", str(_IP_FILE)])
+    # Use bundled ip.txt if available
+    ip_file = _find_ip_file()
+    if ip_file is not None:
+        cmd.extend(["-f", str(ip_file)])
     if skip_download:
         cmd.append("-dd")
     if test_url:
