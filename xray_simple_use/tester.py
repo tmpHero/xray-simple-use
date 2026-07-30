@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from xray_simple_use.vless import VLESSConfig, generate_test_config
-from xray_simple_use.xray import _get_xray_binary, _CONFIG_FILE
+from xray_simple_use.xray import _get_xray_binary_or_raise, _CONFIG_FILE
 from xray_simple_use.speedtest import probe_socks, ProbeResult
 
 _TEST_URL = "https://www.google.com"
@@ -157,9 +157,7 @@ def test_candidates(
     Raises:
         RuntimeError: If xray binary not found or all tests fail.
     """
-    xray_bin = _get_xray_binary()
-    if not xray_bin.exists():
-        raise RuntimeError("Xray binary not found. Run setup first.")
+    xray_bin = _get_xray_binary_or_raise()
 
     if not active_ip:
         active_ip = ips[0] if ips else cfg.address

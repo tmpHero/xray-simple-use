@@ -25,12 +25,15 @@ XRAY_DOWNLOAD_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/
 _STOP_TIMEOUT = 5  # seconds to wait after SIGTERM before SIGKILL
 
 
-def _get_xray_binary() -> Path:
-    """Get path to xray binary based on platform."""
-    sysname = platform.system().lower()
-    if sysname == "windows":
-        return _XRAY_DIR / "xray.exe"
-    return _XRAY_DIR / "xray"
+def _get_xray_binary() -> Path | None:
+    """Find xray binary (may be in a subdirectory after extraction)."""
+    suffix = ".exe" if platform.system().lower() == "windows" else ""
+    name = f"xray{suffix}"
+    for root, _dirs, files in os.walk(_XRAY_DIR):
+        for f in files:
+            if f == name:
+                return Path(root) / f
+    return None
 
 
 def _fetch(url: str, dest: Path, retries: int = 3) -> None:
@@ -85,12 +88,20 @@ def download_xray(url: str = XRAY_DOWNLOAD_URL) -> Path:
         tmp_path.unlink(missing_ok=True)
 
     xray_bin = _get_xray_binary()
-    if not xray_bin.exists():
-        raise RuntimeError(f"Xray binary not found after extraction: {xray_bin}")
+    if xray_bin is None:
+        raise RuntimeError("xray binary not found after extraction")
 
     xray_bin.chmod(0o755)
     print(f"Xray-core installed to {_XRAY_DIR}")
     return xray_bin
+
+
+def _get_xray_binary_or_raise() -> Path:
+    """Get xray binary path, raise RuntimeError if not found."""
+    p = _get_xray_binary()
+    if p is None:
+        raise RuntimeError("xray binary not found. Run setup or download first.")
+    return p
 
 
 def start_xray(config: dict | None = None, config_path: str | None = None) -> subprocess.Popen:
@@ -110,11 +121,7 @@ def start_xray(config: dict | None = None, config_path: str | None = None) -> su
     if is_running():
         raise RuntimeError("Xray is already running. Stop it first.")
 
-    xray_bin = _get_xray_binary()
-    if not xray_bin.exists():
-        raise RuntimeError(
-            f"Xray binary not found at {xray_bin}. Run download first."
-        )
+    xray_bin = _get_xray_binary_or_raise()
 
     if config_path is None:
         config_path = str(_CONFIG_FILE)

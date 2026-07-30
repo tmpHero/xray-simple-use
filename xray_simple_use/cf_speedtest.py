@@ -44,14 +44,14 @@ class IPResult:
 
 
 def _get_cfst_binary() -> Path | None:
-    """Find the CloudflareSpeedTest binary (may be 'cfst' or 'CloudflareST')."""
-    candidates = ["cfst", "CloudflareST"]
+    """Find the CloudflareSpeedTest binary (may be in a subdirectory)."""
+    names = ["cfst", "CloudflareST"]
     if os.name == "nt":
-        candidates = ["cfst.exe", "CloudflareST.exe"]
-    for name in candidates:
-        p = _CFST_DIR / name
-        if p.exists():
-            return p
+        names = ["cfst.exe", "CloudflareST.exe"]
+    for root, _dirs, files in os.walk(_CFST_DIR):
+        for f in files:
+            if f in names:
+                return Path(root) / f
     return None
 
 

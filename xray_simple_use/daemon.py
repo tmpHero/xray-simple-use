@@ -427,11 +427,11 @@ class Daemon:
         """Probe a single candidate IP via temporary xray + probe_socks. Returns True if OK."""
         import json, tempfile, subprocess as sp
         from xray_simple_use.vless import generate_test_config
-        from xray_simple_use.xray import _get_xray_binary
+        from xray_simple_use.xray import _get_xray_binary_or_raise
         from pathlib import Path as P
 
         test_cfg = generate_test_config(self.cfg, [ip], test_base_port=11901)
-        xray_bin = _get_xray_binary()
+        xray_bin = _get_xray_binary_or_raise()
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
         json.dump(test_cfg, tmp, indent=2, ensure_ascii=False)
         tmp.close()
