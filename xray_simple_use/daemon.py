@@ -85,6 +85,7 @@ class Daemon:
         self._scan_lock = threading.Lock()
         self._queue_lock = threading.RLock()
         self._recovery_stop = threading.Event()
+        self._scanning = False  # True while CFST/candidate test is running
 
     def run(self):
         """Entry point: startup, then main loop."""
@@ -164,6 +165,9 @@ class Daemon:
             if self.fail_count > 0:
                 log.info(f"[HEALTH] Recovered after {self.fail_count} failures.")
             self.fail_count = 0
+        elif self._scanning:
+            # CFST is running — don't count network congestion as proxy failure
+            log.debug("[HEALTH] Timeout during scan, suppressed.")
         else:
             self.fail_count += 1
             log.warning(f"[HEALTH] Failure {self.fail_count}/{self.app_config.failure_threshold}")
@@ -279,6 +283,13 @@ class Daemon:
 
     def _do_scan(self, emergency: bool = False):
         """Full CFST scan + real-link test + transactional queue update."""
+        self._scanning = True
+        try:
+            self._do_scan_inner(emergency)
+        finally:
+            self._scanning = False
+
+    def _do_scan_inner(self, emergency: bool = False):
         import xray_simple_use.cf_speedtest as cfst_mod
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         custom_csv = cfst_mod._PROJECT_ROOT / f"cfst_result_{ts}.csv"
