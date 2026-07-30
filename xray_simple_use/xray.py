@@ -33,15 +33,21 @@ def _get_xray_binary() -> Path:
     return _XRAY_DIR / "xray"
 
 
-def _fetch(url: str, dest: Path) -> None:
-    """Download a file via curl (faster, shows progress), with urllib fallback."""
+def _fetch(url: str, dest: Path, retries: int = 3) -> None:
+    """Download a file via curl with retry on failure. Falls back to urllib."""
     if shutil.which("curl"):
-        result = subprocess.run(
-            ["curl", "-L", "-f", "-#", "-o", str(dest), url],
-            capture_output=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"curl exited with code {result.returncode}")
+        for attempt in range(1, retries + 1):
+            retry_flag = ["--retry", "3", "--retry-delay", "2"] if attempt == 1 else []
+            result = subprocess.run(
+                ["curl", "-L", "-f", "-#", "-o", str(dest)] + retry_flag + [url],
+                capture_output=False,
+            )
+            if result.returncode == 0:
+                return
+            if attempt < retries:
+                print(f"Download failed (curl code {result.returncode}), retrying ({attempt + 1}/{retries}) ...")
+                time.sleep(2)
+        raise RuntimeError(f"curl failed after {retries} attempts (code {result.returncode})")
     else:
         urllib.request.urlretrieve(url, dest)
 

@@ -72,12 +72,19 @@ def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
     print(f"Downloading CloudflareSpeedTest from {url} ...")
     tmp_path = _CFST_DIR / "cfst.tar.gz"
     if shutil.which("curl"):
-        result = subprocess.run(
-            ["curl", "-L", "-f", "-#", "-o", str(tmp_path), url],
-            capture_output=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"curl exited with code {result.returncode}")
+        for attempt in range(1, 4):
+            result = subprocess.run(
+                ["curl", "-L", "-f", "-#", "--retry", "3", "--retry-delay", "2",
+                 "-o", str(tmp_path), url],
+                capture_output=False,
+            )
+            if result.returncode == 0:
+                break
+            if attempt < 3:
+                print(f"Download failed (curl code {result.returncode}), retrying ({attempt + 1}/3) ...")
+                time.sleep(2)
+        else:
+            raise RuntimeError(f"curl failed after 3 attempts (code {result.returncode})")
     else:
         urllib.request.urlretrieve(url, tmp_path)
 
