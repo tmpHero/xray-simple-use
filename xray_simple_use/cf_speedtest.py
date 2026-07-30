@@ -199,16 +199,11 @@ def run_speedtest(
     result = subprocess.run(
         cmd,
         cwd=str(_CFST_DIR),
-        capture_output=True,
-        text=True,
     )
-
-    print(result.stdout)
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"CloudflareSpeedTest exited with code {result.returncode}. "
-            f"stderr: {result.stderr}"
+            f"CloudflareSpeedTest exited with code {result.returncode}."
         )
 
     if not _RESULT_CSV.exists():
