@@ -8,12 +8,14 @@
 
 ---
 
+支持 `vmess://` 和 `vless://` 两种分享链接格式，自动识别。
+
 ## 快速开始
 
 ```bash
 git clone <this-repo> && cd xray_simple_use
 
-# 1. 从 v2rayN 复制 VLESS 链接，写入配置文件
+# 1. 从 v2rayN 复制分享链接，写入配置文件
 cp config.example.ini config.ini
 chmod 600 config.ini
 nano config.ini    # 修改 [server] vless_url
