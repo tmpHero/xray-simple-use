@@ -55,12 +55,12 @@ def _fetch(url: str, dest: Path, retries: int = 3) -> None:
         urllib.request.urlretrieve(url, dest)
 
 
-def download_xray(url: str = XRAY_DOWNLOAD_URL) -> Path:
+def download_xray(url: str = "") -> Path:
     """
     Download and extract Xray-core binary.
 
     Args:
-        url: Download URL for Xray-core zip.
+        url: Download URL (empty = default GitHub releases/latest).
 
     Returns:
         Path to the extracted xray binary.
@@ -68,6 +68,8 @@ def download_xray(url: str = XRAY_DOWNLOAD_URL) -> Path:
     Raises:
         RuntimeError: If download or extraction fails.
     """
+    if not url:
+        url = XRAY_DOWNLOAD_URL
     _THIRD_PARTY.mkdir(parents=True, exist_ok=True)
 
     if _XRAY_DIR.exists():

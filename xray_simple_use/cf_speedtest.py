@@ -67,12 +67,12 @@ def _find_ip_file() -> Path | None:
     return None
 
 
-def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
+def download_cfst(url: str = "") -> Path:
     """
     Download and extract CloudflareSpeedTest binary.
 
     Args:
-        url: Download URL for the release tarball.
+        url: Download URL (empty = default GitHub releases/latest).
 
     Returns:
         Path to the extracted binary.
@@ -80,6 +80,8 @@ def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
     Raises:
         RuntimeError: If download or extraction fails.
     """
+    if not url:
+        url = CFST_DOWNLOAD_URL
     _THIRD_PARTY.mkdir(parents=True, exist_ok=True)
 
     if _CFST_DIR.exists():

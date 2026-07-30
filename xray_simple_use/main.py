@@ -106,7 +106,8 @@ def main():
     p_stab.add_argument("--download-url", type=str, default="http://speedtest.tele2.net/5MB.zip", help="URL for download test")
 
     # setup
-    subparsers.add_parser("setup", help="Download xray-core and CloudflareSpeedTest")
+    p_setup = subparsers.add_parser("setup", help="Download xray-core and CloudflareSpeedTest")
+    p_setup.add_argument("--mirror", type=str, default="", help="GitHub mirror prefix (e.g. https://gh-proxy.com/)")
 
     args = parser.parse_args()
 
@@ -377,11 +378,21 @@ def _parse_duration(s: str) -> int:
 
 def cmd_setup(args):
     """Download xray-core and CloudflareSpeedTest."""
+    mirror = args.mirror or ""
+
     print("=== Downloading Xray-core ===")
-    download_xray()
+    if mirror:
+        download_xray(url=mirror + "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip")
+    else:
+        download_xray()
+
     print("\n=== Downloading CloudflareSpeedTest ===")
-    download_cfst()
-    print("\nSetup complete. Use 'start <vless_url>' to begin.")
+    if mirror:
+        download_cfst(url=mirror + "https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/cfst_linux_amd64.tar.gz")
+    else:
+        download_cfst()
+
+    print("\nSetup complete.")
 
 
 if __name__ == "__main__":
