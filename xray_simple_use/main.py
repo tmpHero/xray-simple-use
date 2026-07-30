@@ -5,6 +5,7 @@ CLI entry point for xray_simple_use — lightweight Xray deployment tool.
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -179,8 +180,32 @@ def cmd_start(args):
 
 
 def cmd_stop(args):
-    """Stop xray-core."""
+    """Stop daemon and xray-core."""
+    # Stop daemon first (it will stop xray on shutdown)
+    daemon_pid = None
+    if _DAEMON_PID_FILE.exists():
+        try:
+            daemon_pid = int(_DAEMON_PID_FILE.read_text().strip())
+        except ValueError:
+            pass
+
+    if daemon_pid:
+        print(f"Stopping daemon (pid={daemon_pid}) ...")
+        try:
+            os.kill(daemon_pid, signal.SIGTERM)
+            time.sleep(1)
+            try:
+                os.kill(daemon_pid, 0)
+                os.kill(daemon_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        except (ProcessLookupError, PermissionError):
+            pass
+        _DAEMON_PID_FILE.unlink(missing_ok=True)
+
+    # Fallback: stop xray directly if still running
     stop_xray()
+    print("Stopped.")
 
 
 def cmd_status(args):
