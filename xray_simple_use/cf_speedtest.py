@@ -71,10 +71,15 @@ def download_cfst(url: str = CFST_DOWNLOAD_URL) -> Path:
 
     print(f"Downloading CloudflareSpeedTest from {url} ...")
     tmp_path = _CFST_DIR / "cfst.tar.gz"
-    try:
+    if shutil.which("curl"):
+        result = subprocess.run(
+            ["curl", "-L", "-f", "-#", "-o", str(tmp_path), url],
+            capture_output=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"curl exited with code {result.returncode}")
+    else:
         urllib.request.urlretrieve(url, tmp_path)
-    except Exception as e:
-        raise RuntimeError(f"Failed to download CloudflareSpeedTest: {e}") from e
 
     print("Extracting ...")
     try:

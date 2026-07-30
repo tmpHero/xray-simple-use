@@ -33,6 +33,19 @@ def _get_xray_binary() -> Path:
     return _XRAY_DIR / "xray"
 
 
+def _fetch(url: str, dest: Path) -> None:
+    """Download a file via curl (faster, shows progress), with urllib fallback."""
+    if shutil.which("curl"):
+        result = subprocess.run(
+            ["curl", "-L", "-f", "-#", "-o", str(dest), url],
+            capture_output=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"curl exited with code {result.returncode}")
+    else:
+        urllib.request.urlretrieve(url, dest)
+
+
 def download_xray(url: str = XRAY_DOWNLOAD_URL) -> Path:
     """
     Download and extract Xray-core binary.
@@ -54,10 +67,7 @@ def download_xray(url: str = XRAY_DOWNLOAD_URL) -> Path:
 
     print(f"Downloading Xray-core from {url} ...")
     tmp_path = _XRAY_DIR / "xray.zip"
-    try:
-        urllib.request.urlretrieve(url, tmp_path)
-    except Exception as e:
-        raise RuntimeError(f"Failed to download Xray-core: {e}") from e
+    _fetch(url, tmp_path)
 
     print("Extracting ...")
     try:
