@@ -172,8 +172,8 @@ def _probe_session(
 
     cold_status, _, cold_ttfb, _ = records[0]
     warm_samples = [
-        ttfb for status, _, ttfb, _ in records[1:]
-        if status == expected_status
+        ttfb for status, num_connects, ttfb, _ in records[1:]
+        if status == expected_status and num_connects == 0
     ]
     successes = sum(1 for status, _, _, _ in records if status == expected_status)
     required_warm = warm_attempts // 2 + 1

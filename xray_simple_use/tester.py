@@ -62,6 +62,8 @@ def _test_single_ip(
         socks_port=socks_port, url=test_url,
         expected_status=expected_status, warm_attempts=attempts, timeout=timeout,
     )
+    if not session.connected:
+        return 0, attempts, 0, session.cold_ttfb_ms, []
     warm_success = len(session.warm_ttfb_samples_ms)
     warm_failure = max(0, attempts - warm_success)
     return warm_success, warm_failure, 0, session.cold_ttfb_ms, session.warm_ttfb_samples_ms
