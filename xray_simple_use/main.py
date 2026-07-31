@@ -436,14 +436,15 @@ def cmd_speedtest(args):
     http_port = args.http_port
 
     if args.mode in ("all", "latency"):
-        print("=== Proxy Latency Test ===")
-        result = test_latency(http_port=http_port, attempts=5, timeout=5)
+        print("=== Proxy TTFB Test ===")
+        result = test_latency(http_port=http_port, warm_attempts=3, timeout=5)
         if result.connected:
-            print(f"  Proxy:     http://127.0.0.1:{http_port}")
-            print(f"  Success:   {result.successes}/{result.attempts}")
-            print(f"  Median:    {result.median_ms} ms")
-            print(f"  Minimum:   {result.minimum_ms} ms")
-            print(f"  Maximum:   {result.maximum_ms} ms")
+            print(f"  Proxy:        http://127.0.0.1:{http_port}")
+            print(f"  Success:      {result.successes}/{result.attempts}")
+            print(f"  Cold TTFB:    {result.cold_ttfb_ms:.1f} ms")
+            print(f"  Warm median:  {result.warm_median_ms:.1f} ms")
+            print(f"  Warm minimum: {result.warm_minimum_ms:.1f} ms")
+            print(f"  Warm maximum: {result.warm_maximum_ms:.1f} ms")
         else:
             print(f"  Failed: {result.error}")
             if args.mode == "latency":

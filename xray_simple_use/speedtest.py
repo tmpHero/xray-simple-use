@@ -5,7 +5,7 @@ Test proxy latency and download speed through HTTP proxy.
 import os
 import statistics
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 _DEFAULT_HTTP_PORT = 10809
@@ -16,12 +16,49 @@ _DOWNLOAD_URL = f"https://speed.cloudflare.com/__down?bytes={_DOWNLOAD_SIZE_BYTE
 _CURL_BIN = "curl"
 
 
+# ── results ────────────────────────────────────────────────────────
+
+@dataclass
+class ProbeResult:
+    """Single-shot proxy probe (cold connect, used for health check)."""
+    ok: bool
+    http_status: Optional[int] = None
+    total_time_ms: Optional[float] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class SessionProbeResult:
+    """Multi-request session probe: cold + warm TTFB."""
+    connected: bool
+    cold_ttfb_ms: float = 0.0
+    warm_ttfb_samples_ms: list[float] = field(default_factory=list)
+    attempts: int = 0
+    successes: int = 0
+    error: str = ""
+
+    @property
+    def warm_median_ms(self) -> float:
+        if not self.warm_ttfb_samples_ms:
+            return 0.0
+        return statistics.median(self.warm_ttfb_samples_ms)
+
+    @property
+    def warm_minimum_ms(self) -> float:
+        return min(self.warm_ttfb_samples_ms) if self.warm_ttfb_samples_ms else 0.0
+
+    @property
+    def warm_maximum_ms(self) -> float:
+        return max(self.warm_ttfb_samples_ms) if self.warm_ttfb_samples_ms else 0.0
+
+
 @dataclass
 class LatencyResult:
     connected: bool
-    median_ms: float = 0.0
-    minimum_ms: float = 0.0
-    maximum_ms: float = 0.0
+    cold_ttfb_ms: float = 0.0
+    warm_median_ms: float = 0.0
+    warm_minimum_ms: float = 0.0
+    warm_maximum_ms: float = 0.0
     attempts: int = 0
     successes: int = 0
     error: str = ""
@@ -37,16 +74,7 @@ class DownloadResult:
     error: str = ""
 
 
-# ── unified probe (used by daemon/tester) ──────────────────────────
-
-@dataclass
-class ProbeResult:
-    """Unified proxy probe result."""
-    ok: bool
-    http_status: Optional[int] = None
-    total_time_ms: Optional[float] = None
-    error: Optional[str] = None
-
+# ── single-shot probe (health check) ───────────────────────────────
 
 def probe_socks(
     socks_port: int,
@@ -54,7 +82,7 @@ def probe_socks(
     expected_status: int = 204,
     timeout: int = 5,
 ) -> ProbeResult:
-    """Probe a URL through SOCKS5 proxy."""
+    """Single cold-connect probe through SOCKS5 proxy."""
     cmd = [
         _CURL_BIN,
         "--socks5-hostname", f"127.0.0.1:{socks_port}",
@@ -87,69 +115,137 @@ def probe_socks(
         return ProbeResult(ok=False, error=str(e))
 
 
-# ── public speedtest API ───────────────────────────────────────────
+# ── session probe (cold + warm) ────────────────────────────────────
+
+def _probe_session(
+    proxy_args: list[str],
+    url: str,
+    expected_status: int = 204,
+    warm_attempts: int = 3,
+    timeout: int = 5,
+) -> SessionProbeResult:
+    """Single curl process: first request = cold, subsequent reuse connection."""
+    transfer_count = 1 + warm_attempts
+
+    cmd = [
+        _CURL_BIN,
+        *proxy_args,
+        "--http1.1",
+        "--silent", "--show-error",
+        "--max-time", str(timeout),
+        "--write-out",
+        "__XSU__%{http_code},%{num_connects},%{time_starttransfer},%{time_total}\n",
+    ]
+    for _ in range(transfer_count):
+        cmd.extend(["--output", os.devnull, url])
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=transfer_count * timeout + 5,
+        )
+    except subprocess.TimeoutExpired:
+        return SessionProbeResult(connected=False, attempts=transfer_count, error="timeout")
+    except FileNotFoundError:
+        return SessionProbeResult(connected=False, attempts=transfer_count, error="curl not found")
+    except Exception as exc:
+        return SessionProbeResult(connected=False, attempts=transfer_count, error=str(exc))
+
+    records: list[tuple[int, int, float, float]] = []
+    for line in proc.stdout.splitlines():
+        if not line.startswith("__XSU__"):
+            continue
+        try:
+            status_text, connects_text, ttfb_text, total_text = line.removeprefix("__XSU__").split(",", 3)
+            records.append((
+                int(status_text), int(connects_text),
+                float(ttfb_text) * 1000, float(total_text) * 1000,
+            ))
+        except (ValueError, TypeError):
+            continue
+
+    if not records:
+        return SessionProbeResult(
+            connected=False, attempts=transfer_count,
+            error=proc.stderr.strip() or "no valid curl results",
+        )
+
+    cold_status, _, cold_ttfb, _ = records[0]
+    warm_samples = [
+        ttfb for status, _, ttfb, _ in records[1:]
+        if status == expected_status
+    ]
+    successes = sum(1 for status, _, _, _ in records if status == expected_status)
+    required_warm = warm_attempts // 2 + 1
+
+    connected = cold_status == expected_status and len(warm_samples) >= required_warm
+    error = ""
+    if not connected:
+        error = f"cold_status={cold_status}, warm_success={len(warm_samples)}/{warm_attempts}"
+
+    return SessionProbeResult(
+        connected=connected,
+        cold_ttfb_ms=round(cold_ttfb, 1),
+        warm_ttfb_samples_ms=[round(v, 1) for v in warm_samples],
+        attempts=transfer_count,
+        successes=successes,
+        error=error,
+    )
+
+
+def probe_http_session(
+    http_port: int,
+    url: str = _PROBE_URL,
+    expected_status: int = 204,
+    warm_attempts: int = 3,
+    timeout: int = 5,
+) -> SessionProbeResult:
+    return _probe_session(
+        proxy_args=["--proxy", f"http://127.0.0.1:{http_port}"],
+        url=url, expected_status=expected_status,
+        warm_attempts=warm_attempts, timeout=timeout,
+    )
+
+
+def probe_socks_session(
+    socks_port: int,
+    url: str = _PROBE_URL,
+    expected_status: int = 204,
+    warm_attempts: int = 3,
+    timeout: int = 5,
+) -> SessionProbeResult:
+    return _probe_session(
+        proxy_args=["--socks5-hostname", f"127.0.0.1:{socks_port}"],
+        url=url, expected_status=expected_status,
+        warm_attempts=warm_attempts, timeout=timeout,
+    )
+
+
+# ── public API ─────────────────────────────────────────────────────
 
 def test_latency(
     http_port: int = _DEFAULT_HTTP_PORT,
-    attempts: int = 5,
+    warm_attempts: int = 3,
     timeout: int = 5,
 ) -> LatencyResult:
-    """
-    Measure first-byte latency via HTTP proxy, median of successful probes.
-
-    Args:
-        http_port: HTTP proxy port.
-        attempts: Number of probe attempts.
-        timeout: Per-attempt timeout in seconds.
-
-    Returns:
-        LatencyResult with median/min/max latencies.
-    """
-    latencies: list[float] = []
-    last_error = ""
-
-    for _ in range(attempts):
-        cmd = [
-            _CURL_BIN,
-            "--proxy", f"http://127.0.0.1:{http_port}",
-            "--fail",
-            "--silent", "--show-error",
-            "--max-time", str(timeout),
-            "--output", os.devnull,
-            "--write-out", "%{http_code},%{time_starttransfer}",
-            _PROBE_URL,
-        ]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
-            if proc.returncode != 0:
-                last_error = proc.stderr.strip() or f"curl exit {proc.returncode}"
-                continue
-            status_text, latency_text = proc.stdout.strip().split(",", 1)
-            if int(status_text) != 204:
-                last_error = f"HTTP {status_text}"
-                continue
-            latencies.append(float(latency_text) * 1000)
-        except subprocess.TimeoutExpired:
-            last_error = "timeout"
-        except (ValueError, TypeError) as exc:
-            last_error = str(exc)
-        except Exception as exc:
-            last_error = str(exc)
-
-    if len(latencies) < (attempts // 2 + 1):
+    """Measure cold TTFB + warm TTFB via HTTP proxy in one curl session."""
+    session = probe_http_session(
+        http_port=http_port, url=_PROBE_URL,
+        expected_status=204, warm_attempts=warm_attempts, timeout=timeout,
+    )
+    if not session.connected:
         return LatencyResult(
-            connected=False,
-            attempts=attempts, successes=len(latencies),
-            error=f"insufficient successful probes: {len(latencies)}/{attempts}",
+            connected=False, attempts=session.attempts,
+            successes=session.successes, error=session.error,
         )
-
     return LatencyResult(
         connected=True,
-        median_ms=round(statistics.median(latencies), 1),
-        minimum_ms=round(min(latencies), 1),
-        maximum_ms=round(max(latencies), 1),
-        attempts=attempts,
-        successes=len(latencies),
+        cold_ttfb_ms=session.cold_ttfb_ms,
+        warm_median_ms=round(session.warm_median_ms, 1),
+        warm_minimum_ms=round(session.warm_minimum_ms, 1),
+        warm_maximum_ms=round(session.warm_maximum_ms, 1),
+        attempts=session.attempts,
+        successes=session.successes,
     )
 
 
@@ -159,23 +255,11 @@ def test_download_speed(
     expected_bytes: int = _DOWNLOAD_SIZE_BYTES,
     timeout: int = 60,
 ) -> DownloadResult:
-    """
-    Download fixed-size data via HTTP proxy and measure speed.
-
-    Args:
-        http_port: HTTP proxy port.
-        test_url: Download URL (must return exact byte count).
-        expected_bytes: Expected download size in bytes.
-        timeout: Download timeout in seconds.
-
-    Returns:
-        DownloadResult with speed and size.
-    """
+    """Download fixed-size data via HTTP proxy and measure speed."""
     cmd = [
         _CURL_BIN,
         "--proxy", f"http://127.0.0.1:{http_port}",
-        "--fail",
-        "--location",
+        "--fail", "--location",
         "--silent", "--show-error",
         "--max-time", str(timeout),
         "--output", os.devnull,
@@ -186,31 +270,22 @@ def test_download_speed(
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
         if proc.returncode != 0:
             return DownloadResult(connected=False, error=proc.stderr.strip() or f"curl exit {proc.returncode}")
-
         parts = proc.stdout.strip().split(",")
         if len(parts) != 3:
             return DownloadResult(connected=False, error="invalid output")
-
-        http_status = int(parts[0])
-        size_bytes = float(parts[1])
-        duration_s = float(parts[2])
-
+        http_status, size_bytes, duration_s = int(parts[0]), float(parts[1]), float(parts[2])
         if http_status != 200:
             return DownloadResult(connected=False, error=f"HTTP {http_status}")
         if size_bytes < expected_bytes * 0.9:
             return DownloadResult(connected=False, error=f"incomplete: {size_bytes / 1024 / 1024:.2f} MiB")
         if duration_s <= 0:
             return DownloadResult(connected=False, error="invalid duration")
-
         speed_mbps = size_bytes * 8 / duration_s / 1_000_000
         speed_mb_s = size_bytes / duration_s / 1024 / 1024
-
         return DownloadResult(
             connected=True,
-            speed_mbps=round(speed_mbps, 2),
-            speed_mb_s=round(speed_mb_s, 2),
-            size_mb=round(size_bytes / 1024 / 1024, 2),
-            duration_s=round(duration_s, 2),
+            speed_mbps=round(speed_mbps, 2), speed_mb_s=round(speed_mb_s, 2),
+            size_mb=round(size_bytes / 1024 / 1024, 2), duration_s=round(duration_s, 2),
         )
     except subprocess.TimeoutExpired:
         return DownloadResult(connected=False, error="timeout")
@@ -222,17 +297,7 @@ def test_download_speed(
         return DownloadResult(connected=False, error=str(exc))
 
 
-def test_connectivity(
-    socks_port: int = 10808,
-    test_url: str = _PROBE_URL,
-    timeout: int = 5,
-) -> ProbeResult:
-    """DEPRECATED: use probe_socks or test_latency instead."""
-    return probe_socks(socks_port, test_url, timeout=timeout)
-
-
 def check_curl_available() -> bool:
-    """Check if curl is available on the system."""
     try:
         subprocess.run([_CURL_BIN, "--version"], capture_output=True, timeout=5)
         return True

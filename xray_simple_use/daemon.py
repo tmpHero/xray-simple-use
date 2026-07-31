@@ -341,8 +341,11 @@ class Daemon:
 
             for r in test_results:
                 log.info(
-                    f"[TEST] {r.ip}: {r.success_count}/{r.success_count + r.failure_count + r.timeout_count} "
-                    f"success, median={r.median_latency:.0f}ms, p95={r.p95_latency:.0f}ms"
+                    f"[TEST] {r.ip}: "
+                    f"{r.success_count}/{r.success_count + r.failure_count + r.timeout_count} success, "
+                    f"cold={r.cold_ttfb_ms:.0f}ms, "
+                    f"warm_median={r.median_latency:.0f}ms, "
+                    f"warm_p95={r.p95_latency:.0f}ms"
                 )
 
             queue_data = results_to_queue_data(test_results)

@@ -25,12 +25,13 @@ _write_lock = threading.Lock()
 class Candidate:
     """Single candidate IP entry in the queue."""
     ip: str
-    median_latency_ms: float = 0.0
+    median_latency_ms: float = 0.0   # warm TTFB median
+    cold_ttfb_ms: float = 0.0
     success_rate: float = 0.0
     p95_latency_ms: float = 0.0
     jitter_ms: float = 0.0
     failures: int = 0
-    circuit_broken_until: float = 0.0  # epoch timestamp, 0 = not broken
+    circuit_broken_until: float = 0.0
 
     def is_available(self) -> bool:
         """Check if this candidate is not in circuit-break cooldown."""
@@ -70,6 +71,7 @@ def load_queue() -> Optional[IPQueue]:
             Candidate(
                 ip=c["ip"],
                 median_latency_ms=c.get("median_latency_ms", 0.0),
+                cold_ttfb_ms=c.get("cold_ttfb_ms", 0.0),
                 success_rate=c.get("success_rate", 0.0),
                 p95_latency_ms=c.get("p95_latency_ms", 0.0),
                 jitter_ms=c.get("jitter_ms", 0.0),
@@ -101,6 +103,7 @@ def save_queue(queue: IPQueue) -> None:
             {
                 "ip": c.ip,
                 "median_latency_ms": c.median_latency_ms,
+                "cold_ttfb_ms": c.cold_ttfb_ms,
                 "success_rate": c.success_rate,
                 "p95_latency_ms": c.p95_latency_ms,
                 "jitter_ms": c.jitter_ms,
@@ -249,7 +252,8 @@ def sort_candidates(results: list[dict]) -> list[Candidate]:
         rate = r["success_count"] / total if total > 0 else 0.0
         candidates.append(Candidate(
             ip=r["ip"],
-            median_latency_ms=r.get("median_latency", 0.0),
+            median_latency_ms=r.get("median_latency", 0.0),  # warm median
+            cold_ttfb_ms=r.get("cold_ttfb", 0.0),
             success_rate=rate,
             p95_latency_ms=r.get("p95_latency", 0.0),
             jitter_ms=r.get("jitter", 0.0),
@@ -257,7 +261,8 @@ def sort_candidates(results: list[dict]) -> list[Candidate]:
 
     candidates.sort(key=lambda c: (
         -c.success_rate,
-        c.median_latency_ms,
+        c.median_latency_ms,   # warm median
+        c.cold_ttfb_ms,        # cold secondary
         c.p95_latency_ms,
         c.jitter_ms,
     ))

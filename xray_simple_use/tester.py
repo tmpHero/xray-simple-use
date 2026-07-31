@@ -15,9 +15,9 @@ from typing import Optional
 
 from xray_simple_use.vless import VLESSConfig, generate_test_config
 from xray_simple_use.xray import _get_xray_binary_or_raise, _CONFIG_FILE
-from xray_simple_use.speedtest import probe_socks, ProbeResult
+from xray_simple_use.speedtest import probe_socks_session, SessionProbeResult
 
-_TEST_URL = "https://www.google.com"
+_TEST_URL = "https://www.gstatic.com/generate_204"
 _DEFAULT_ATTEMPTS = 3
 _DEFAULT_TIMEOUT = 8
 _TEST_BASE_PORT = 11001
@@ -31,10 +31,11 @@ class TestResult:
     success_count: int = 0
     failure_count: int = 0
     timeout_count: int = 0
-    latencies: list[float] = field(default_factory=list)  # ms
+    cold_ttfb_ms: float = 0.0
+    latencies: list[float] = field(default_factory=list)  # warm TTFB ms
     median_latency: float = 0.0
     p95_latency: float = 0.0
-    jitter: float = 0.0  # stddev of latencies
+    jitter: float = 0.0
     tls_ok: bool = False
 
     @property
@@ -49,37 +50,21 @@ def _test_single_ip(
     attempts: int = _DEFAULT_ATTEMPTS,
     timeout: int = _DEFAULT_TIMEOUT,
     expected_status: int = _EXPECTED_STATUS,
-) -> tuple[int, int, int, list[float]]:
+) -> tuple[int, int, int, float, list[float]]:
     """
-    Test a single IP through its dedicated SOCKS5 port using unified probe_socks.
-
-    Args:
-        socks_port: SOCKS5 port for this candidate.
-        test_url: URL to request.
-        attempts: Number of test requests.
-        timeout: Per-request timeout in seconds.
-        expected_status: Expected HTTP status code.
+    Test a single IP through its dedicated SOCKS5 port using session probe.
+    First request = cold connect, subsequent requests reuse connection (warm).
 
     Returns:
-        Tuple of (success_count, failure_count, timeout_count, latencies_ms).
+        Tuple of (warm_success, warm_failure, timeout, cold_ttfb_ms, warm_ttfb_list).
     """
-    success = 0
-    failure = 0
-    timeout_cnt = 0
-    latencies: list[float] = []
-
-    for _ in range(attempts):
-        result = probe_socks(socks_port, test_url, expected_status, timeout)
-        if result.ok:
-            success += 1
-            if result.total_time_ms is not None:
-                latencies.append(result.total_time_ms)
-        elif result.error == "timeout":
-            timeout_cnt += 1
-        else:
-            failure += 1
-
-    return success, failure, timeout_cnt, latencies
+    session = probe_socks_session(
+        socks_port=socks_port, url=test_url,
+        expected_status=expected_status, warm_attempts=attempts, timeout=timeout,
+    )
+    warm_success = len(session.warm_ttfb_samples_ms)
+    warm_failure = max(0, attempts - warm_success)
+    return warm_success, warm_failure, 0, session.cold_ttfb_ms, session.warm_ttfb_samples_ms
 
 
 def _compute_stats(latencies: list[float]) -> tuple[float, float, float]:
@@ -208,18 +193,19 @@ def test_candidates(
             futures[ip] = future
 
         for ip, future in futures.items():
-            success, failure, timeout_cnt, latencies = future.result()
-            median, p95, jitter = _compute_stats(latencies)
+            success, failure, timeout_cnt, cold_ttfb, warm_latencies = future.result()
+            median, p95, jitter = _compute_stats(warm_latencies)
             result = TestResult(
                 ip=ip,
                 success_count=success,
                 failure_count=failure,
                 timeout_count=timeout_cnt,
-                latencies=latencies,
+                cold_ttfb_ms=cold_ttfb,
+                latencies=warm_latencies,
                 median_latency=median,
                 p95_latency=p95,
                 jitter=jitter,
-                tls_ok=success > 0,
+                tls_ok=cold_ttfb > 0 and success > 0,
             )
             results.append(result)
 
@@ -253,13 +239,16 @@ def results_to_queue_data(results: list[TestResult]) -> list[dict]:
             "ip": r.ip,
             "success_count": r.success_count,
             "failure_count": r.failure_count + r.timeout_count,
-            "median_latency": r.median_latency,
+            "median_latency": r.median_latency,  # warm median
             "p95_latency": r.p95_latency,
             "jitter": r.jitter,
+            "cold_ttfb": r.cold_ttfb_ms,
         })
-    # Sort by success_rate desc, then median_latency asc
     data.sort(key=lambda d: (
         -(d["success_count"] / max(d["success_count"] + d["failure_count"], 1)),
-        d["median_latency"],
+        d["median_latency"],   # warm first
+        d["cold_ttfb"],         # cold as secondary
+        d["p95_latency"],
+        d["jitter"],
     ))
     return data
