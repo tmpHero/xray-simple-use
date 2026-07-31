@@ -271,9 +271,9 @@ def cmd_run(args):
 
         pid = os.fork()
         if pid != 0:
-            print(f"Daemon started (pid={pid}). Use 'log' to view output.")
+            print(f"Daemon started (pid={pid}). Use 'log' to view output.", flush=True)
             _DAEMON_PID_FILE.write_text(str(pid))
-            return
+            os._exit(0)
         # Child: detach from terminal
         os.setsid()
         sys.stdout = open(os.devnull, "w")
