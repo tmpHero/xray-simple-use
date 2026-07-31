@@ -78,13 +78,13 @@ class Daemon:
         self.queue: Optional[IPQueue] = None
         self.fail_count = 0
         self.last_rescan_date = ""
-        self._stop = False
         self._socks_port = 10808
         self._http_port = 10809
         self._scan_lock = threading.Lock()
         self._queue_lock = threading.RLock()
         self._recovery_stop = threading.Event()
-        self._scanning = False  # True while CFST/candidate test is running
+        self._stop_event = threading.Event()
+        self._scanning = False
 
     def run(self):
         """Entry point: startup, then main loop."""
@@ -104,12 +104,12 @@ class Daemon:
         recovery_thread = threading.Thread(target=self._recovery_loop, daemon=True)
         recovery_thread.start()
 
-        while not self._stop:
+        while not self._stop_event.is_set():
             try:
                 self._tick()
             except Exception as e:
                 log.error(f"[DAEMON] Tick error: {e}")
-            time.sleep(self.app_config.health_interval)
+            self._stop_event.wait(self.app_config.health_interval)
 
         self._recovery_stop.set()
         log.info("[DAEMON] Shutting down ...")
@@ -118,7 +118,7 @@ class Daemon:
 
     def _handle_signal(self, signum, frame):
         log.info(f"[DAEMON] Received signal {signum}, stopping ...")
-        self._stop = True
+        self._stop_event.set()
 
     # ── Startup ────────────────────────────────────────────────────
 
