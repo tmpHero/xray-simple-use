@@ -53,7 +53,6 @@ from xray_simple_use.queue import (
     clear_cooldown,
 )
 from xray_simple_use.speedtest import (
-    test_connectivity,
     probe_socks,
     ProbeResult,
 )

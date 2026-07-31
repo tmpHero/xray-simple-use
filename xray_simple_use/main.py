@@ -43,10 +43,9 @@ from xray_simple_use.cf_speedtest import (
     _get_cfst_binary,
 )
 from xray_simple_use.speedtest import (
-    test_connectivity,
+    probe_socks as _probe_socks,
     test_latency,
     test_download_speed,
-    quick_verify,
     check_curl_available,
 )
 from xray_simple_use.daemon import Daemon
@@ -89,11 +88,11 @@ def main():
     p_opt.add_argument("--url", type=str, default="", help="vless:// link (if no existing config)")
 
     # speedtest
-    p_speed = subparsers.add_parser("speedtest", help="Test proxy speed through SOCKS5")
-    p_speed.add_argument("--socks-port", type=int, default=10808, help="SOCKS5 port (default: 10808)")
+    p_speed = subparsers.add_parser("speedtest", help="Test proxy speed through HTTP proxy")
+    p_speed.add_argument("--http-port", type=int, default=10809, help="HTTP proxy port (default: 10809)")
     p_speed.add_argument(
         "--mode",
-        choices=["all", "connect", "latency", "download"],
+        choices=["all", "latency", "download"],
         default="all",
         help="Test mode (default: all)",
     )
@@ -372,7 +371,10 @@ def _do_verify_with_result() -> tuple[bool, float, str]:
     """Quick connectivity check through proxy, return (success, latency, error)."""
     if not check_curl_available():
         return False, 0.0, "curl not available"
-    return quick_verify()
+    result = _probe_socks(10808, "https://www.gstatic.com/generate_204")
+    if result.ok:
+        return True, result.total_time_ms or 0.0, ""
+    return False, 0.0, result.error or "unknown"
 
 
 def _do_verify():
@@ -385,39 +387,35 @@ def _do_verify():
 
 
 def cmd_speedtest(args):
-    """Test proxy connectivity, latency, and download speed."""
+    """Test proxy latency and download speed through HTTP proxy."""
     if not check_curl_available():
-        print("curl is required for speedtest. Install: apt install curl")
+        print("curl is required. Install: apt install curl")
         sys.exit(1)
 
-    socks_port = args.socks_port
-
-    if args.mode in ("all", "connect"):
-        print("=== Connectivity Test ===")
-        result = test_connectivity(socks_port=socks_port)
-        if result.connected:
-            print(f"  Connected: YES (latency={result.latency_ms}ms)")
-        else:
-            print(f"  Connected: NO  ({result.error})")
-            if args.mode == "connect":
-                return
+    http_port = args.http_port
 
     if args.mode in ("all", "latency"):
-        print("\n=== Latency Test ===")
-        latencies = test_latency(socks_port=socks_port)
-        for url, lat in latencies.items():
-            if lat is not None:
-                print(f"  {url}: {lat}ms")
-            else:
-                print(f"  {url}: FAILED")
+        print("=== Proxy Latency Test ===")
+        result = test_latency(http_port=http_port, attempts=5, timeout=5)
+        if result.connected:
+            print(f"  Proxy:     http://127.0.0.1:{http_port}")
+            print(f"  Success:   {result.successes}/{result.attempts}")
+            print(f"  Median:    {result.median_ms} ms")
+            print(f"  Minimum:   {result.minimum_ms} ms")
+            print(f"  Maximum:   {result.maximum_ms} ms")
+        else:
+            print(f"  Failed: {result.error}")
+            if args.mode == "latency":
+                return
 
     if args.mode in ("all", "download"):
         print("\n=== Download Speed Test ===")
-        dl_result = test_download_speed(socks_port=socks_port)
+        dl_result = test_download_speed(http_port=http_port, timeout=60)
         if dl_result.connected:
-            print(f"  Speed: {dl_result.download_speed_mbps} Mbps")
-            print(f"  Downloaded: {dl_result.download_size_mb} MB")
-            print(f"  Duration: {dl_result.download_duration_s}s")
+            print(f"  Proxy:     http://127.0.0.1:{http_port}")
+            print(f"  Speed:     {dl_result.speed_mbps} Mbps ({dl_result.speed_mb_s} MiB/s)")
+            print(f"  Size:      {dl_result.size_mb} MiB")
+            print(f"  Duration:  {dl_result.duration_s} s")
         else:
             print(f"  Failed: {dl_result.error}")
 

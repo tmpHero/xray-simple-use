@@ -25,11 +25,11 @@ _LOGS_DIR = _PROJECT_ROOT / "logs"
 _LATENCY_INTERVAL = 10     # seconds
 _DOWNLOAD_INTERVAL = 300   # 5 minutes
 _RESOURCE_INTERVAL = 60    # 1 minute
-_DOWNLOAD_SIZE_MB = 5
 
 _PRIMARY_PROBE_URL = "https://www.gstatic.com/generate_204"
 _SECONDARY_PROBE_URL = "https://cp.cloudflare.com/"
-_DOWNLOAD_URL = "http://speedtest.tele2.net/5MB.zip"
+_DOWNLOAD_SIZE_BYTES = 5 * 1024 * 1024
+_DOWNLOAD_URL = f"https://speed.cloudflare.com/__down?bytes={_DOWNLOAD_SIZE_BYTES}"
 _EXPECTED_STATUS = 204
 _HTTP_PROXY = "http://127.0.0.1:10809"
 
@@ -306,24 +306,29 @@ class StabilityTest:
         cmd = [
             "curl",
             "--proxy", _HTTP_PROXY,
+            "--fail",
+            "--location",
             "--silent", "--show-error",
             "--max-time", str(timeout),
-            "--max-filesize", str(_DOWNLOAD_SIZE_MB * 1024 * 1024),
             "--output", os.devnull,
-            "--write-out", "%{size_download},%{time_total}",
-            "-L",
+            "--write-out", "%{http_code},%{size_download},%{time_total}",
             self.download_url,
         ]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
-            parts = proc.stdout.strip().split(",")
-            if len(parts) != 2:
+            if proc.returncode != 0:
                 return False, 0.0, 0.0, 0.0
-            size_bytes = float(parts[0])
-            duration_s = float(parts[1])
+            parts = proc.stdout.strip().split(",")
+            if len(parts) != 3:
+                return False, 0.0, 0.0, 0.0
+            http_status = int(parts[0])
+            size_bytes = float(parts[1])
+            duration_s = float(parts[2])
+            if http_status != 200:
+                return False, 0.0, 0.0, 0.0
+            if size_bytes < _DOWNLOAD_SIZE_BYTES * 0.9:
+                return False, size_bytes / 1024 / 1024, duration_s, 0.0
             size_mb = size_bytes / (1024 * 1024)
-            if size_mb < 1.0:
-                return False, size_mb, duration_s, 0.0
             speed_mbps = (size_bytes * 8) / (duration_s * 1_000_000) if duration_s > 0 else 0.0
             return True, size_mb, duration_s, speed_mbps
         except Exception:
