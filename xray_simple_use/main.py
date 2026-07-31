@@ -200,13 +200,12 @@ def cmd_stop(args):
             except Exception:
                 pass
 
-        # Wait with timeout, then force kill
+        # Wait for the entire process group to exit, then force kill
         deadline = time.time() + 5
         while time.time() < deadline:
-            try:
-                os.kill(daemon_pid, 0)
+            if _process_group_exists(daemon_pid):
                 time.sleep(0.2)
-            except ProcessLookupError:
+            else:
                 break
         else:
             try:
@@ -223,6 +222,26 @@ def cmd_stop(args):
     stop_xray()
 
     print("Stopped.")
+
+
+def _process_group_exists(pgid: int) -> bool:
+    """Check if any process in the process group still exists."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except AttributeError:
+        # os.killpg not available, fall back to checking leader PID
+        try:
+            os.kill(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
 
 
 def cmd_status(args):
