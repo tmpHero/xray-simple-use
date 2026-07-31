@@ -276,8 +276,12 @@ def cmd_run(args):
             os._exit(0)
         # Child: detach from terminal
         os.setsid()
-        sys.stdout = open(os.devnull, "w")
-        sys.stderr = open(os.devnull, "w")
+        # Redirect stdin/stdout/stderr to /dev/null
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, 0)
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        os.close(devnull)
 
     # Load config
     config_path = Path(args.config) if args.config else None
