@@ -136,8 +136,12 @@ def test_latency(
         except Exception as exc:
             last_error = str(exc)
 
-    if not latencies:
-        return LatencyResult(connected=False, attempts=attempts, successes=0, error=last_error or "all probes failed")
+    if len(latencies) < (attempts // 2 + 1):
+        return LatencyResult(
+            connected=False,
+            attempts=attempts, successes=len(latencies),
+            error=f"insufficient successful probes: {len(latencies)}/{attempts}",
+        )
 
     return LatencyResult(
         connected=True,
