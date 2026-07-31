@@ -204,7 +204,29 @@ def cmd_stop(args):
 
     # Fallback: stop xray directly if still running
     stop_xray()
+
+    # Kill any orphaned cfst or test xray subprocesses
+    _kill_orphans()
+
     print("Stopped.")
+
+
+def _kill_orphans():
+    """Kill any leftover cfst or test xray processes."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "third_party/(cfst|xray-core|CloudflareST)"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            for pid_str in result.stdout.strip().split("\n"):
+                if pid_str:
+                    try:
+                        os.kill(int(pid_str), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+    except FileNotFoundError:
+        pass  # pgrep not available
 
 
 def cmd_status(args):
